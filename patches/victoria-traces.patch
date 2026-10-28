@@ -1,0 +1,25 @@
+diff --git a/deployment/docker/Makefile b/deployment/docker/Makefile
+index 3bee8a334..6e58cc199 100644
+--- a/deployment/docker/Makefile
++++ b/deployment/docker/Makefile
+@@ -5,7 +5,7 @@ DOCKER_NAMESPACE ?= victoriametrics
+ 
+ ROOT_IMAGE ?= gcr.io/distroless/static:latest@sha256:47b2d72ff90843eb8a768b5c2f89b40741843b639d065b9b937b07cd59b479c6
+ 
+-GO_BUILDER_IMAGE := golang:1.27.2
++GO_BUILDER_IMAGE := golang:1.27.3
+ 
+ BUILDER_IMAGE := local/builder:2.0.0-$(shell echo $(GO_BUILDER_IMAGE) | tr :/ __)-1
+ DOCKER ?= docker
+diff --git a/go.mod b/go.mod
+index 0a39113ec..6e18e650d 100644
+--- a/go.mod
++++ b/go.mod
+@@ -1,6 +1,6 @@
+ module github.com/VictoriaMetrics/VictoriaTraces
+ 
+-go 1.27.2
++go 1.27.3
+ 
+ require (
+ 	github.com/VictoriaMetrics/VictoriaLogs v1.121.1-0.20260716015338-c945d2949e98 // v1.52.0

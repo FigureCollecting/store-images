@@ -1,0 +1,30 @@
+name: upstream-watch
+
+# Weekly: fail loudly if VictoriaLogs or VictoriaTraces has published a stable release newer than
+# the tag we rebuild. That is the signal to re-pin consumers to upstream's own image and archive
+# this repository. Opens nothing, writes nothing.
+on:
+  schedule:
+    - cron: "17 13 * * 1"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: upstream-watch
+  cancel-in-progress: false
+
+jobs:
+  watch:
+    name: upstream release check
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Compare upstream releases with our base tags
+        run: python3 scripts/upstream_watch.py
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
