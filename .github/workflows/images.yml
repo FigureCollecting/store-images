@@ -1,0 +1,93 @@
+name: images
+
+# Pull requests: build both images, scan them (trivy AND grype, fail on any fixable HIGH/CRITICAL),
+# and smoke-run them. No registry push, no secrets.
+# Push to main: the same, then publish the scanned image to ghcr.io with SBOM + provenance attestations.
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions: {}
+
+concurrency:
+  group: images-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  BUILDKIT_IMAGE: docker.io/moby/buildkit:v0.34.1@sha256:99368f3e46177c6405b9740e4461d91cee004128daeecca78d4ceac50ec1da5c
+
+jobs:
+  unit:
+    name: unit tests
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Unit tests (gate and upstream watch)
+        run: python3 -m unittest discover -s tests -v
+
+  verify:
+    name: verify ${{ matrix.app }}
+    if: github.event_name == 'pull_request'
+    needs: unit
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        app: [victoria-logs, victoria-traces]
+    env:
+      APP: ${{ matrix.app }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          driver-opts: image=${{ env.BUILDKIT_IMAGE }}
+      - name: Build
+        run: scripts/build.sh "$APP" archive "$RUNNER_TEMP/$APP.tar"
+      - name: Scan gate (trivy + grype)
+        run: scripts/scan.sh "$APP" "$RUNNER_TEMP/$APP.tar" "$RUNNER_TEMP/scan-$APP"
+      - name: Smoke (health, version string, Go buildinfo)
+        run: scripts/smoke.sh "$APP" "$RUNNER_TEMP/$APP.tar"
+
+  publish:
+    name: publish ${{ matrix.app }}
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: unit
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write # push to ghcr.io/figurecollecting; this job runs only on push to main
+    strategy:
+      fail-fast: false
+      matrix:
+        app: [victoria-logs, victoria-traces]
+    env:
+      APP: ${{ matrix.app }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          driver-opts: image=${{ env.BUILDKIT_IMAGE }}
+      - name: Build
+        run: scripts/build.sh "$APP" archive "$RUNNER_TEMP/$APP.tar"
+      - name: Scan gate (trivy + grype)
+        run: scripts/scan.sh "$APP" "$RUNNER_TEMP/$APP.tar" "$RUNNER_TEMP/scan-$APP"
+      - name: Smoke (health, version string, Go buildinfo)
+        run: scripts/smoke.sh "$APP" "$RUNNER_TEMP/$APP.tar"
+      - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Publish the scanned image (push by digest, verify, then tag)
+        run: scripts/build.sh "$APP" push "$RUNNER_TEMP/$APP.tar"

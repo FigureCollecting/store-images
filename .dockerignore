@@ -1,0 +1,3 @@
+# The build context needs only the Go-version patches.
+*
+!patches/
