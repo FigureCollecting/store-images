@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 # Build one image from images/<app>.env (linux/amd64).
 #
-#   scripts/build.sh <app> archive <out.tar>   image tarball (docker + OCI layout), no attestations: input to scan.sh and smoke.sh
-#   scripts/build.sh <app> push <scanned.tar>     publish what was scanned, with SBOM + provenance attestations
+#   scripts/build.sh <app> archive <out.tar>    image tarball (docker + OCI layout), no attestations;
+#                                              the input to scan.sh and smoke.sh
+#   scripts/build.sh <app> push <scanned.tar>   publish what was scanned, with SBOM + provenance attestations
 #
-# push runs in the same job right after `archive`, so every layer comes from the builder's cache. It pushes
-# by digest (no tag), checks that the pushed linux/amd64 manifest is byte-for-byte the scanned one, and
-# only then adds the tag <UPSTREAM_TAG>-<FC_REVISION>. An existing tag is never overwritten: bump
-# FC_REVISION in images/<app>.env to publish a new build.
+# Builds are reproducible: SOURCE_DATE_EPOCH is the commit time and layer timestamps are rewritten to it.
+# push pushes by digest (no tag), checks that the pushed linux/amd64 manifest is byte-for-byte the scanned
+# one, and only then adds the tag <UPSTREAM_TAG>-<FC_REVISION>. An existing tag is never overwritten:
+# bump FC_REVISION in images/<app>.env to publish a new build.
 set -euo pipefail
 SBOM_GENERATOR=docker.io/docker/buildkit-syft-scanner:1.12.1@sha256:873a7458c3c8ac8e32c7b796c10e1600b07b963d2aa000a72a2d97aaaa2d6315
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -42,7 +43,7 @@ amd64_manifest() {  # amd64_manifest <index-or-manifest JSON on stdin> -> digest
 case "$mode" in
   archive)
     docker buildx build "${args[@]}" --provenance=false --sbom=false --tag "$IMAGE:$tag" \
-      --output "type=docker,dest=$tar,oci-mediatypes=true" "$ROOT"
+      --output "type=docker,dest=$tar,oci-mediatypes=true,rewrite-timestamp=true" "$ROOT"
     ;;
   push)
     [ -f "$tar" ] || { echo "no scanned archive $tar" >&2; exit 2; }
@@ -58,7 +59,7 @@ case "$mode" in
     fi
     meta=$(mktemp); trap 'rm -f "$meta"' EXIT
     docker buildx build "${args[@]}" --provenance=mode=max --attest "type=sbom,generator=$SBOM_GENERATOR" \
-      --output "type=image,name=$IMAGE,oci-mediatypes=true,push-by-digest=true,name-canonical=true,push=true" \
+      --output "type=image,name=$IMAGE,oci-mediatypes=true,rewrite-timestamp=true,push-by-digest=true,name-canonical=true,push=true" \
       --metadata-file "$meta" "$ROOT"
     digest=$(jq -r '."containerimage.digest"' "$meta")
     pushed=$(docker buildx imagetools inspect --raw "$IMAGE@$digest" | amd64_manifest)
