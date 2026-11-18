@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Fail if a Dockerfile in this repository uses an image or a download that is not pinned.
 
-Every image a build reads (FROM, COPY --from, RUN --mount from=) must end in @sha256:<64 hex>, unless
-it is an earlier build stage or scratch. Every remote ADD must carry --checksum=sha256:<64 hex>.
-Variables are resolved from ARG defaults only; a reference that cannot be resolved is a failure.
+Every image a build reads (FROM, COPY --from, RUN --mount from=, the `# syntax=` frontend) must end in
+@sha256:<64 hex>, unless it is an earlier build stage or scratch. Every remote ADD must carry
+--checksum=sha256:<64 hex>. Variables are resolved from ARG defaults only; a reference that cannot be
+resolved is a failure. Checked: files named Dockerfile*, *.Dockerfile or Containerfile* anywhere in the
+tree, and whatever file an images/*.env names as its DOCKERFILE.
 Exit 1 if anything is unpinned, 2 if there is no Dockerfile or one cannot be read, 0 otherwise.
 """
 import argparse
@@ -17,6 +19,8 @@ CHECKSUM = re.compile(r"^sha256:[0-9a-f]{64}$")
 VARIABLE = re.compile(r"\$(?:\{(\w+)\}|(\w+))")
 REMOTE = re.compile(r"^(?:https?://|git://|git@)")
 HEREDOC = re.compile(r"(?<!<)<<(?!<)-?\s*[\"']?(\w+)")
+DIRECTIVE = re.compile(r"^#\s*([a-zA-Z][a-zA-Z0-9]*)\s*=\s*(.+?)\s*$")
+NAMES = ("Dockerfile*", "dockerfile*", "*.Dockerfile", "*.dockerfile", "Containerfile*")
 
 
 def instructions(text):
@@ -40,6 +44,21 @@ def instructions(text):
         pending, start = "", 0
     if until:
         yield opened, "UNCLOSED", [until]
+
+
+def syntax_directive(text):
+    """Return (line number, image) of a `# syntax=` parser directive, or None.
+
+    BuildKit pulls that image to parse the file. Directives are the `# key=value` lines at the very top;
+    the first line of any other shape ends them, so a later `# syntax=` is an ordinary comment.
+    """
+    for number, raw in enumerate(text.splitlines(), 1):
+        directive = DIRECTIVE.match(raw)
+        if not directive:
+            return None
+        if directive.group(1).lower() == "syntax":
+            return number, directive.group(2)
+    return None
 
 
 def expand(value, args):
@@ -68,6 +87,9 @@ def check_dockerfile(text):
         elif ref.lower() not in stages and not (ref.isdigit() and int(ref) < froms) and not DIGEST_SUFFIX.search(ref):
             problems.append(f"line {line}: {what}{ref} is not pinned by digest (@sha256:<64 hex>)")
 
+    frontend = syntax_directive(text)
+    if frontend:
+        image(frontend[0], "# syntax=", frontend[1])
     for line, name, words in instructions(text):
         flags, rest = split_flags(words)
         if name == "ARG":
@@ -106,11 +128,22 @@ def check_dockerfile(text):
     return problems if froms or problems else ["no FROM instruction"]
 
 
+def dockerfiles(root):
+    """Every file to check: the usual names anywhere in the tree, plus any DOCKERFILE an image definition names."""
+    found = {os.path.normpath(path) for pattern in NAMES
+             for path in glob.glob(os.path.join(root, "**", pattern), recursive=True)}
+    for definition in filter(os.path.isfile, glob.glob(os.path.join(root, "images", "*.env"))):
+        with open(definition, encoding="utf-8", errors="replace") as fh:
+            found.update(os.path.normpath(os.path.join(root, line.split("=", 1)[1].strip()))
+                         for line in fh if line.startswith("DOCKERFILE="))
+    return sorted(found)
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--root", default=os.path.join(os.path.dirname(__file__), ".."))
     args = ap.parse_args(argv)
-    paths = sorted(glob.glob(os.path.join(args.root, "**", "Dockerfile*"), recursive=True))
+    paths = dockerfiles(args.root)
     if not paths:
         print(f"::error title=Pin check failed::no Dockerfile under {args.root}")
         return 2

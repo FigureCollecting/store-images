@@ -104,7 +104,19 @@ done <<'EOF'
 .plugins.public_key_retrieval_disabled true
 .security.disable_gravatar true
 .snapshots.external_enabled false
+.grafana_com.url http://127.0.0.1:9
+.grafana_com.api_url http://127.0.0.1:9/api
+.grafana_net.url http://127.0.0.1:9
 EOF
+
+# The grafana.com proxy, which any signed-in user can call, must not try to reach grafana.com either.
+before=$(docker logs "$name" 2>&1 | wc -l)
+gnet=$(api /api/gnet/plugins -o /dev/null -w '%{http_code}')
+sleep 2
+docker logs "$name" 2>&1 | tail -n "+$((before + 1))" >"$work/gnet.log"
+tried=$(grep -cE 'lookup |no such host|network is unreachable|grafana\.(com|net)' "$work/gnet.log")
+check gnet "GET /api/gnet/plugins -> HTTP ${gnet:-none}, ${tried} attempts to reach grafana.com logged" \
+  test "$tried" = 0 -a -n "$gnet" -a "$gnet" != 200
 frontend=$(api /api/frontend/settings)
 got=$(jq -c '{hasUpdate: .buildInfo.hasUpdate, latestVersion: .buildInfo.latestVersion, newsFeedEnabled, pluginAdminEnabled, preinstalled: (.pluginCatalogPreinstalledPlugins | length)}' <<<"$frontend" 2>/dev/null)
 check frontend "/api/frontend/settings ${got:-no answer}" \
@@ -114,6 +126,22 @@ check frontend "/api/frontend/settings ${got:-no answer}" \
 # shellcheck disable=SC2016  # expanded by the shell inside the container
 dir=$(docker exec "$name" sh -c 'if [ -w "$GF_PATHS_PLUGINS" ]; then echo "writable $GF_PATHS_PLUGINS"; else echo "read-only $GF_PATHS_PLUGINS: $(ls "$GF_PATHS_PLUGINS" | tr "\n" " ")"; fi' 2>/dev/null)
 check plugin-dir "${dir:-no answer}" test "$dir" = "read-only /usr/share/grafana/plugins: victoriametrics-logs-datasource "
+# The plugins load unsigned, so nothing verifies their files at start: the running user must not be able to
+# change any of them, in either plugin tree (the bundled one holds Jaeger).
+trees=(/usr/share/grafana/plugins /usr/share/grafana/data/plugins-bundled)
+# shellcheck disable=SC2016  # expanded by the shell inside the container
+writable=$(docker exec "$name" sh -c 'find "$@" ! -type l \( \( -user "$(id -u)" -perm -0200 \) -o \( -group "$(id -g)" -perm -0020 \) -o -perm -0002 \) | wc -l' sh "${trees[@]}" 2>/dev/null)
+files=$(docker exec "$name" sh -c 'find "$@" | wc -l' sh "${trees[@]}" 2>/dev/null)
+check plugin-files "${writable:-?} of ${files:-?} plugin files and directories are writable by the running user" \
+  test "${writable:-1}" = 0 -a "${files:-0}" -gt 50
+# shellcheck disable=SC2016  # expanded by the shell inside the container
+tamper=$(docker exec "$name" sh -c 'd=/usr/share/grafana/data/plugins-bundled/jaeger
+  { echo "// x" >>"$d/module.js"; } 2>/dev/null && echo "module.js WRITTEN"
+  { rm -f "$d/plugin.json"; } 2>/dev/null; [ -e "$d/plugin.json" ] || echo "plugin.json REMOVED"
+  { mv "$d" "$d.x"; } 2>/dev/null && echo "directory RENAMED"
+  { : >/usr/share/grafana/data/plugins-bundled/new; } 2>/dev/null && echo "sibling CREATED"
+  echo done' 2>/dev/null | tr '\n' ' ')
+check plugin-tamper "as the running user, change the Jaeger plugin: '${tamper:-no answer}'" test "$tamper" = "done "
 backends=$(docker exec "$name" find / -xdev -type f \( -name 'gpx_*' -o -name '*_backend_plugin_*' \) 2>/dev/null | sort | tr '\n' ' ')
 jaeger_bin=/usr/share/grafana/data/plugins-bundled/jaeger/gpx_grafana-jaeger-datasource_linux_amd64
 vlogs_bin=/usr/share/grafana/plugins/victoriametrics-logs-datasource/victoriametrics_logs_backend_plugin_linux_amd64

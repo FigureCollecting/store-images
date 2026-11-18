@@ -127,6 +127,39 @@ class DockerfileTest(unittest.TestCase):
         self.assertEqual(self.problems("# nothing\nARG A=1\n"), ["no FROM instruction"])
         self.assertEqual(self.problems("FROM\n"), ["line 1: FROM names no image"])
 
+    def test_a_stage_index_must_name_an_earlier_stage(self):
+        self.assertEqual(self.problems(f"FROM x@{D}\nFROM x@{D}\nCOPY --from=1 /a /a\n"), [])
+        for ref in ("2", "7"):
+            with self.subTest(ref=ref):
+                got = self.problems(f"FROM x@{D}\nFROM x@{D}\nCOPY --from={ref} /a /a\n")
+                self.assertEqual(got, [f"line 3: COPY --from={ref} is not pinned by digest (@sha256:<64 hex>)"])
+        got = self.problems(f"FROM x@{D}\nRUN --mount=type=bind,from=1,target=/b true\n")
+        self.assertEqual(got, ["line 2: RUN --mount from=1 is not pinned by digest (@sha256:<64 hex>)"])
+
+    def test_a_here_string_is_not_a_heredoc(self):
+        got = self.problems(f"FROM x@{D}\nRUN cat <<<EOF\nFROM busybox:latest\nEOF\n")
+        self.assertEqual(got, ["line 3: FROM busybox:latest is not pinned by digest (@sha256:<64 hex>)"])
+        got = self.problems(f"FROM x@{D}\nRUN cat <<<\"$x\" && cat <<<word\nFROM busybox:latest\n")
+        self.assertEqual(got, ["line 3: FROM busybox:latest is not pinned by digest (@sha256:<64 hex>)"])
+
+    def test_the_syntax_directive_names_an_image_and_must_be_pinned(self):
+        for line in ("# syntax=docker/dockerfile:1", "#syntax = docker/dockerfile:1.7", "# SYNTAX=docker/dockerfile",
+                     "#   Syntax=docker.io/docker/dockerfile:1@sha256:abc"):
+            with self.subTest(line=line):
+                got = self.problems(f"{line}\nFROM x@{D}\n")
+                self.assertEqual(len(got), 1, got)
+                self.assertRegex(got[0], r"^line 1: # syntax=\S+ is not pinned by digest")
+        self.assertEqual(self.problems(f"# syntax=docker/dockerfile:1@{D}\n# escape=\\\nFROM x@{D}\n"), [])
+        self.assertEqual(self.problems(f"# escape=`\n# syntax=docker/dockerfile:1\nFROM x@{D}\n")[0][:16], "line 2: # syntax")
+
+    def test_a_syntax_line_after_the_directives_is_only_a_comment(self):
+        for text in (f"# a comment\n# syntax=docker/dockerfile:1\nFROM x@{D}\n",
+                     f"\n# syntax=docker/dockerfile:1\nFROM x@{D}\n",
+                     f"FROM x@{D}\n# syntax=docker/dockerfile:1\n",
+                     f"# check=skip=all\n# about syntax=x\nFROM x@{D}\n"):
+            with self.subTest(text=text):
+                self.assertEqual(self.problems(text), [])
+
 
 class MainTest(unittest.TestCase):
     def setUp(self):
@@ -163,6 +196,52 @@ class MainTest(unittest.TestCase):
         self.assertIn("::error file=Dockerfile.grafana::Dockerfile.grafana: line 1: FROM grafana/grafana:13.3.1 "
                       "is not pinned by digest", out)
         self.assertIn("Dockerfile: 1 FROM, pinned", out)
+
+    def test_a_dockerfile_named_by_an_image_definition_is_checked_whatever_its_name(self):
+        self.write("Dockerfile", PINNED)
+        os.makedirs(os.path.join(self.tmp.name, "images"))
+        os.makedirs(os.path.join(self.tmp.name, "recipes"))
+        self.write("images/grafana.env", "# x\nAPP_NAME=grafana\nDOCKERFILE=recipes/grafana.build\n")
+        self.write("images/other.env", "APP_NAME=other\n")
+        self.write("recipes/grafana.build", "FROM grafana/grafana:13.3.1\n")
+        rc, out = self.run_main()
+        self.assertEqual(rc, 1, out)
+        self.assertIn("::error file=recipes/grafana.build::recipes/grafana.build: line 1: FROM grafana/grafana:13.3.1 "
+                      "is not pinned by digest", out)
+        self.write("recipes/grafana.build", PINNED)
+        rc, out = self.run_main()
+        self.assertEqual(rc, 0, out)
+        self.assertIn("recipes/grafana.build: 1 FROM, pinned", out)
+        self.assertEqual(out.count("Dockerfile: 1 FROM, pinned"), 1)
+
+    def test_a_definition_naming_a_missing_dockerfile_is_an_error(self):
+        self.write("Dockerfile", PINNED)
+        os.makedirs(os.path.join(self.tmp.name, "images"))
+        self.write("images/grafana.env", "DOCKERFILE=Dockerfile.gone\n")
+        rc, out = self.run_main()
+        self.assertEqual(rc, 2, out)
+        self.assertIn("::error file=Dockerfile.gone::Dockerfile.gone: cannot read", out)
+
+    def test_other_common_dockerfile_names_are_found(self):
+        self.write("Dockerfile", PINNED)
+        for name in ("grafana.Dockerfile", "x.dockerfile", "Containerfile", "Containerfile.grafana", "dockerfile"):
+            with self.subTest(name=name):
+                self.write(name, "FROM grafana/grafana:13.3.1\n")
+                rc, out = self.run_main()
+                self.assertEqual(rc, 1, out)
+                self.assertIn(f"::error file={name}::{name}: line 1: FROM grafana/grafana:13.3.1 is not pinned", out)
+                os.remove(os.path.join(self.tmp.name, name))
+        rc, out = self.run_main()
+        self.assertEqual(rc, 0, out)
+
+    def test_a_definition_that_names_the_default_dockerfile_does_not_check_it_twice(self):
+        self.write("Dockerfile", PINNED)
+        os.makedirs(os.path.join(self.tmp.name, "images"))
+        self.write("images/a.env", "DOCKERFILE=Dockerfile\n")
+        self.write("images/b.env", "DOCKERFILE=./Dockerfile\n")
+        rc, out = self.run_main()
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(out.count("FROM, pinned"), 1)
 
     def test_no_dockerfiles_is_an_error(self):
         rc, out = self.run_main()

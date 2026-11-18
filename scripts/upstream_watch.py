@@ -2,7 +2,7 @@
 """Fail loudly when upstream has published a stable release newer than an image's base tag.
 
 For every images/*.env: list the upstream repository's GitHub releases, ignore drafts, pre-releases
-and tags that are not plain vX.Y.Z, and compare the newest with UPSTREAM_TAG. Every other
+and tags that are not vX.Y.Z or vX.Y.Z+security-NN, and compare the newest with UPSTREAM_TAG. Every other
 <KEY>_REPO / <KEY>_TAG pair of the definition (a component baked into the image) is checked the same way.
 Exit 1 if any image has a newer upstream release, 2 if a check could not be made, 0 otherwise.
 A newer release is the signal to re-pin consumers to upstream's own image and archive this repository,
@@ -16,9 +16,11 @@ import json
 import os
 import re
 import sys
+import urllib.parse
 import urllib.request
 
-SEMVER = re.compile(r"^v(\d+)\.(\d+)\.(\d+)$")
+# vX.Y.Z, or Grafana's out-of-band security release of it, vX.Y.Z+security-NN (newer than vX.Y.Z itself).
+SEMVER = re.compile(r"^v(\d+)\.(\d+)\.(\d+)(?:\+security-(\d+))?$")
 GITHUB = re.compile(r"^https://github\.com/([\w.-]+/[\w.-]+?)(?:\.git)?$")
 # What a newer release asks for, chosen by WATCH_ACTION in the definition (default: archive).
 ACTIONS = {
@@ -39,7 +41,8 @@ def github_releases(owner_repo, opener=urllib.request.urlopen):
 
 def gomod_at(owner_repo, tag, opener=urllib.request.urlopen):
     """The root go.mod of a public repository at a tag. No token: the raw host is not the API."""
-    req = urllib.request.Request(f"https://raw.githubusercontent.com/{owner_repo}/{tag}/go.mod")
+    req = urllib.request.Request(
+        f"https://raw.githubusercontent.com/{owner_repo}/{urllib.parse.quote(tag, safe='')}/go.mod")
     with opener(req, timeout=30) as resp:
         return resp.read().decode("utf-8")
 
@@ -56,8 +59,9 @@ def read_env(path):
 
 
 def version(tag):
+    """(major, minor, patch, security) of vX.Y.Z or vX.Y.Z+security-NN, else None. Plain vX.Y.Z is security 0."""
     m = SEMVER.match(tag or "")
-    return tuple(int(x) for x in m.groups()) if m else None
+    return tuple(int(x or 0) for x in m.groups()) if m else None
 
 
 def newest_stable(releases):

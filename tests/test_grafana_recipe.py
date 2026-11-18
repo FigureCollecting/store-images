@@ -54,6 +54,36 @@ class ServerRebuildTest(unittest.TestCase):
         self.assertIn("server dep[[:space:]]+${UPSTREAM_PATCH_MODULE}[[:space:]]+${UPSTREAM_PATCH_VERSION}[[:space:]]", smoke)
         self.assertIn("fc-${UPSTREAM_PATCH_MODULE##*/}-${UPSTREAM_PATCH_VERSION}", smoke)
 
+    def test_every_rebuilt_binary_is_checked_against_the_pinned_go(self):
+        text = read("Dockerfile.grafana")
+        go = self.env["GO_VERSION"]
+        self.assertRegex(text, rf"(?m)^ARG GO_IMAGE=docker\.io/library/golang:{re.escape(go)}@sha256:[0-9a-f]{{64}}$")
+        self.assertIn('RUN --network=none test "$(go env GOVERSION)" = "go${GO_VERSION}"', text)
+        for stage, binary in (("server", "/out/grafana"), ("jaeger", "/out/backend"), ("vlogs", "/out/backend")):
+            with self.subTest(stage=stage):
+                body = text.split(f"FROM go AS {stage}\n", 1)[1].split("\nFROM ", 1)[0]
+                self.assertRegex(body, r"(?m)^ARG .*\bGO_VERSION\b|^    .*\bGO_VERSION\b")
+                self.assertIn(f'test "$(head -n 1 /tmp/buildinfo)" = "{binary}: go${{GO_VERSION}}"', body)
+        self.assertGreaterEqual(tuple(int(x) for x in go.split(".")),
+                                tuple(int(x) for x in self.env["UPSTREAM_GO_VERSION"].split(".")))
+
+    def test_the_image_defaults_point_every_grafana_com_address_at_loopback(self):
+        text = read("Dockerfile.grafana")
+        for line in ("GF_GRAFANA_COM_URL=http://127.0.0.1:9 \\", "GF_GRAFANA_COM_API_URL=http://127.0.0.1:9/api \\",
+                     "GF_GRAFANA_NET_URL=http://127.0.0.1:9 \\"):
+            self.assertIn(f"    {line}\n", text)
+        smoke = read("scripts/smoke-grafana.sh")
+        self.assertIn("api /api/gnet/plugins", smoke)
+        self.assertIn(".grafana_com.api_url http://127.0.0.1:9/api", smoke)
+
+    def test_nothing_time_stamped_is_written_and_the_plugin_trees_are_locked(self):
+        text = read("Dockerfile.grafana")
+        self.assertIn("apk add --no-network --no-logfile /tmp/zlib.apk", text)
+        self.assertIn('test "$(sha256sum /var/log/apk.log)" = "${apklog}"', text)
+        self.assertNotIn("-o grafana", text)
+        self.assertIn("/usr/share/grafana/plugins /usr/share/grafana/data/plugins-bundled ! -type l "
+                      "\\( ! -user root -o -perm -0020 -o -perm -0002 \\)", text)
+
     def test_the_readme_says_when_to_drop_the_rebuild(self):
         readme = " ".join(read("README.md").split())
         self.assertIn(f"`{self.module}` {self.version}", readme)

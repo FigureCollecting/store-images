@@ -148,6 +148,49 @@ class WatchTest(unittest.TestCase):
         self.assertEqual(rc, 1)
         self.assertIn("v0.12.10", out)
 
+    def test_an_out_of_band_security_release_is_newer_than_its_base(self):
+        self.images(grafana=GF)
+        others = {"VictoriaMetrics/victorialogs-datasource": [rel("v0.34.0")],
+                  "grafana/grafana-jaeger-datasource": [rel("v13.0.8")]}
+        rc, out = self.run_watch({"grafana/grafana": [rel("v13.3.1"), rel("v13.3.1+security-01")], **others})
+        self.assertEqual(rc, 1, out)
+        self.assertIn("::error title=Upstream released grafana v13.3.1+security-01::grafana: base v13.3.1, upstream "
+                      "released v13.3.1+security-01. Re-pin", out)
+        for tags, newest in ((["v13.3.1+security-02", "v13.3.1+security-01", "v13.3.1+security-10"], "v13.3.1+security-10"),
+                             (["v13.3.2", "v13.3.1+security-04"], "v13.3.2"),
+                             (["v13.3.2+security-01", "v13.3.2", "v13.4.0-rc1"], "v13.3.2+security-01"),
+                             (["v12.4.15+security-09", "v13.3.1+security-01"], "v13.3.1+security-01")):
+            with self.subTest(tags=tags):
+                rc, out = self.run_watch({"grafana/grafana": [rel(t) for t in tags], **others})
+                self.assertEqual(rc, 1, out)
+                self.assertIn(f"::error title=Upstream released grafana {newest}::", out)
+
+    def test_a_security_release_can_be_the_base_and_odd_suffixes_are_not_releases(self):
+        self.images(grafana=GF.replace("UPSTREAM_TAG=v13.3.1\n", "UPSTREAM_TAG=v13.3.1+security-01\n"))
+        others = {"VictoriaMetrics/victorialogs-datasource": [rel("v0.34.0")],
+                  "grafana/grafana-jaeger-datasource": [rel("v13.0.8")]}
+        rc, out = self.run_watch({"grafana/grafana": [
+            rel("v13.3.1"), rel("v13.3.1+security-01"), rel("v13.3.1+security-"), rel("v13.3.1+build-02"),
+            rel("v13.3.1+security-02x"), rel("v13.3.1-security-03"), rel("v13.3.1+security-01+security-02")], **others})
+        self.assertEqual(rc, 0, out)
+        self.assertIn("grafana: base v13.3.1+security-01, newest upstream release v13.3.1+security-01: no newer", out)
+        rc, out = self.run_watch({"grafana/grafana": [rel("v13.3.1+security-02")], **others})
+        self.assertEqual(rc, 1, out)
+
+    def test_the_go_mod_of_a_security_release_is_read_at_its_own_tag(self):
+        rc, out = self.grafana_release("v13.3.1+security-01", GOMOD)
+        self.assertEqual(rc, 1)
+        self.assertEqual(self.gomod_calls, [("grafana/grafana", "v13.3.1+security-01")])
+        self.assertIn("upstream released v13.3.1+security-01.", out)
+        self.assertIn("It still ships github.com/apache/thrift v0.24.0 (ours v0.25.0): KEEP the server rebuild.", out)
+
+    def test_the_single_line_require_form_is_read(self):
+        rc, out = self.grafana_release("v13.3.2", "module m\n\nrequire github.com/apache/thrift v0.25.0\n")
+        self.assertEqual(rc, 1)
+        self.assertIn("It ships github.com/apache/thrift v0.25.0 (ours v0.25.0): DROP", out)
+        rc, out = self.grafana_release("v13.3.2", "module m\n\nrequire   github.com/apache/thrift   v0.24.0 // indirect\n")
+        self.assertIn("It still ships github.com/apache/thrift v0.24.0 (ours v0.25.0): KEEP", out)
+
     def test_drafts_prereleases_and_odd_tags_are_ignored(self):
         self.images(victoria_logs=VL)
         rc, out = self.run_watch({"VictoriaMetrics/VictoriaLogs": [
@@ -302,6 +345,8 @@ class FetchTest(unittest.TestCase):
         self.assertEqual(seen["url"], "https://raw.githubusercontent.com/grafana/grafana/v13.3.2/go.mod")
         self.assertIsNone(seen["auth"])
         self.assertEqual(seen["timeout"], 30)
+        upstream_watch.gomod_at("grafana/grafana", "v13.3.1+security-01", opener=opener)
+        self.assertEqual(seen["url"], "https://raw.githubusercontent.com/grafana/grafana/v13.3.1%2Bsecurity-01/go.mod")
 
     def test_github_fetch_without_token_sends_no_auth(self):
         seen = {}

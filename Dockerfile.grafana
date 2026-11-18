@@ -1,7 +1,8 @@
 # Grafana OSS for the internal log and trace viewer: upstream's image, pinned by digest, with
 #   - victoriametrics-logs-datasource baked in from its release zip (pinned version, sha256-verified);
 #   - every bundled data source we do not use removed (only Jaeger stays: it reads VictoriaTraces'
-#     /select/jaeger), and the image flattened so the removed files are in no layer;
+#     /select/jaeger), and the image flattened so the removed files are in no layer; both plugin trees
+#     are root-owned and read-only for the Grafana user;
 #   - the backends of the two data sources rebuilt from their release tags with the dependency fixes
 #     upstream has on main but has not released (patches/grafana-jaeger.patch, patches/grafana-vlogs.patch),
 #     using the flags of upstream's own release binaries; nothing else of the plugins is changed;
@@ -12,7 +13,7 @@
 # Build arguments come from images/grafana.env via scripts/build.sh; target = grafana.
 # Every RUN has no network, except the six that fetch a pinned source tree or its go.sum-verified modules.
 ARG GRAFANA_IMAGE=docker.io/grafana/grafana:13.3.1@sha256:0615ec4fbd4072004b7d86b46ded63013a74b7d6eb1119273dd89e8fa25c13cf
-ARG GO_IMAGE=docker.io/library/golang:1.27.3@sha256:2669ec97bbb6e54602952b4171211116e3fe90e5f9c47619920c74554b3d7d09
+ARG GO_IMAGE=docker.io/library/golang:1.27.4@sha256:205c7636d74e0ffbe3d007162df7d74f859f5a8c8322dfb9f907977686c126cf
 ARG VLOGS_DS_ZIP=https://github.com/VictoriaMetrics/victorialogs-datasource/releases/download/v0.34.0/victoriametrics-logs-datasource-v0.34.0.zip
 ARG VLOGS_DS_SHA256=sha256:6fc61446097a525e826f2ddb6746723f85447845c95a7b1a99624e84d4b2e237
 ARG ZLIB_APK=https://dl-cdn.alpinelinux.org/alpine/v3.24/main/x86_64/zlib-1.4-r0.apk
@@ -28,12 +29,14 @@ WORKDIR /src
 FROM ${GRAFANA_IMAGE} AS upstream
 
 # Grafana's server: the public release tag with ONE module moved (patches/grafana-server.patch), built with
-# upstream's settings (go1.27.3, CGO off, -trimpath, no tags: `go version -m` on upstream's binary).
-# The build fails unless the result has the patched version and is otherwise built from exactly the
-# modules, at exactly the versions and hashes, of upstream's own binary.
+# upstream's settings (CGO off, -trimpath, no tags: `go version -m` on upstream's binary) and a newer Go
+# patch release than upstream's (GO_VERSION against UPSTREAM_GO_VERSION).
+# The build fails unless the result is built by that Go, has the patched version and is otherwise built
+# from exactly the modules, at exactly the versions and hashes, of upstream's own binary.
 # `grafana server -v` reports the tag's commit and a branch that names the patch.
 FROM go AS server
-ARG UPSTREAM_REPO UPSTREAM_TAG UPSTREAM_COMMIT UPSTREAM_BUILD_STAMP UPSTREAM_PATCH_MODULE UPSTREAM_PATCH_VERSION
+ARG UPSTREAM_REPO UPSTREAM_TAG UPSTREAM_COMMIT UPSTREAM_BUILD_STAMP UPSTREAM_PATCH_MODULE UPSTREAM_PATCH_VERSION \
+    UPSTREAM_GO_VERSION GO_VERSION
 RUN git -c advice.detachedHead=false clone --quiet --depth 1 --branch "${UPSTREAM_TAG}" "${UPSTREAM_REPO}" . \
  && test "$(git rev-parse HEAD)" = "${UPSTREAM_COMMIT}"
 COPY patches/grafana-server.patch /tmp/deps.patch
@@ -46,6 +49,8 @@ RUN --network=none GOPROXY=off go build -buildvcs=false -trimpath \
       -ldflags "-X main.version=${UPSTREAM_TAG#v} -X main.commit=${UPSTREAM_COMMIT} -X main.buildBranch=${UPSTREAM_TAG}-fc-${UPSTREAM_PATCH_MODULE##*/}-${UPSTREAM_PATCH_VERSION} -X main.buildstamp=${UPSTREAM_BUILD_STAMP}" \
       -o /out/grafana ./pkg/cmd/grafana \
  && go version -m /out/grafana >/tmp/buildinfo && go version -m /tmp/upstream >/tmp/upstream-buildinfo \
+ && test "$(head -n 1 /tmp/buildinfo)" = "/out/grafana: go${GO_VERSION}" \
+ && test "$(head -n 1 /tmp/upstream-buildinfo)" = "/tmp/upstream: go${UPSTREAM_GO_VERSION}" \
  && grep -qP "^\tdep\t${UPSTREAM_PATCH_MODULE}\t${UPSTREAM_PATCH_VERSION}\t" /tmp/buildinfo \
  && grep -cP "^\tdep\t${UPSTREAM_PATCH_MODULE}\t" /tmp/upstream-buildinfo | grep -qx 1 \
  && diff <(tail -n +2 /tmp/upstream-buildinfo | grep -vP "^\tdep\t${UPSTREAM_PATCH_MODULE}\t") \
@@ -54,7 +59,7 @@ RUN --network=none GOPROXY=off go build -buildvcs=false -trimpath \
 
 # Jaeger data source backend: its release tag with golang.org/x/net moved to the fixed version.
 FROM go AS jaeger
-ARG JAEGER_DS_REPO JAEGER_DS_TAG JAEGER_DS_COMMIT JAEGER_DS_BUILD_TIME XNET_VERSION
+ARG JAEGER_DS_REPO JAEGER_DS_TAG JAEGER_DS_COMMIT JAEGER_DS_BUILD_TIME XNET_VERSION GO_VERSION
 RUN git -c advice.detachedHead=false clone --quiet --depth 1 --branch "${JAEGER_DS_TAG}" "${JAEGER_DS_REPO}" . \
  && test "$(git rev-parse HEAD)" = "${JAEGER_DS_COMMIT}"
 COPY patches/grafana-jaeger.patch /tmp/deps.patch
@@ -66,6 +71,7 @@ RUN --network=none GOPROXY=off go build -tags arrow_json_stdlib \
       -ldflags "-w -s -extldflags \"-static\" -X 'github.com/grafana/grafana-plugin-sdk-go/build/buildinfo.buildInfoJSON={\"time\":${JAEGER_DS_BUILD_TIME},\"pluginID\":\"jaeger\",\"version\":\"${JAEGER_DS_TAG#v}\"}' -X 'main.pluginID=jaeger' -X 'main.version=${JAEGER_DS_TAG#v}'" \
       -o /out/backend ./pkg \
  && go version -m /out/backend >/tmp/buildinfo \
+ && test "$(head -n 1 /tmp/buildinfo)" = "/out/backend: go${GO_VERSION}" \
  && grep -qP "^\tdep\tgolang.org/x/net\t${XNET_VERSION}\t" /tmp/buildinfo \
  && grep -qP "^\tbuild\tvcs.revision=${JAEGER_DS_COMMIT}$" /tmp/buildinfo \
  && test "$(git status --porcelain --untracked-files=no | tr '\n' ' ')" = " M go.mod  M go.sum "
@@ -74,7 +80,7 @@ RUN --network=none GOPROXY=off go build -tags arrow_json_stdlib \
 # golang.org/x/text it requires) and klauspost/compress moved to fixed versions, built with the fixed Go.
 # The tag vendors its modules; the patched go.mod is built from the module cache instead (-mod=readonly).
 FROM go AS vlogs
-ARG VLOGS_DS_REPO VLOGS_DS_TAG VLOGS_DS_COMMIT VLOGS_DS_BUILD_TIME XNET_VERSION COMPRESS_VERSION
+ARG VLOGS_DS_REPO VLOGS_DS_TAG VLOGS_DS_COMMIT VLOGS_DS_BUILD_TIME XNET_VERSION COMPRESS_VERSION GO_VERSION
 RUN git -c advice.detachedHead=false clone --quiet --depth 1 --branch "${VLOGS_DS_TAG}" "${VLOGS_DS_REPO}" . \
  && test "$(git rev-parse HEAD)" = "${VLOGS_DS_COMMIT}"
 COPY patches/grafana-vlogs.patch /tmp/deps.patch
@@ -87,6 +93,7 @@ RUN --network=none GOPROXY=off go build -tags arrow_json_stdlib \
       -ldflags "-w -s -extldflags \"-static\" -X 'github.com/grafana/grafana-plugin-sdk-go/build/buildinfo.buildInfoJSON={\"time\":${VLOGS_DS_BUILD_TIME},\"pluginID\":\"victoriametrics-logs-datasource\",\"version\":\"${VLOGS_DS_TAG#v}\"}' -X 'main.pluginID=victoriametrics-logs-datasource' -X 'main.version=${VLOGS_DS_TAG#v}'" \
       -o /out/backend ./pkg \
  && go version -m /out/backend >/tmp/buildinfo \
+ && test "$(head -n 1 /tmp/buildinfo)" = "/out/backend: go${GO_VERSION}" \
  && grep -qP "^\tdep\tgolang.org/x/net\t${XNET_VERSION}\t" /tmp/buildinfo \
  && grep -qP "^\tdep\tgithub.com/klauspost/compress\t${COMPRESS_VERSION}\t" /tmp/buildinfo \
  && grep -qP "^\tbuild\tvcs.revision=${VLOGS_DS_COMMIT}$" /tmp/buildinfo \
@@ -102,22 +109,27 @@ COPY --from=jaeger /out/backend /tmp/jaeger-backend
 COPY --from=vlogs /out/backend /tmp/vlogs-backend
 COPY --from=server /out/grafana /tmp/grafana-server
 # A rebuilt backend no longer matches its plugin's signed MANIFEST.txt, so the manifest goes and the two
-# plugins are allowed to load unsigned below. The VictoriaLogs zip also carries backends for other
-# platforms, which are removed.
+# plugins are allowed to load unsigned below. Nothing then checks their files at start, so both plugin
+# trees become root-owned and read-only for the Grafana user (upstream ships the bundled one world-writable).
+# The VictoriaLogs zip also carries backends for other platforms, which are removed.
+# apk writes the time of day into /var/log/apk.log; it is told not to, so that the image is reproducible.
 RUN --network=none set -eu; \
+    apklog="$(sha256sum /var/log/apk.log)"; \
     test "$(grafana --version)" = "grafana version ${UPSTREAM_TAG#v}"; \
     cat /tmp/grafana-server >/usr/share/grafana/bin/grafana; \
     test "$(grafana --version)" = "grafana version ${UPSTREAM_TAG#v}"; \
     test "$(grafana server -v)" = "Version ${UPSTREAM_TAG#v} (commit: ${UPSTREAM_COMMIT}, branch: ${UPSTREAM_TAG}-fc-${UPSTREAM_PATCH_MODULE##*/}-${UPSTREAM_PATCH_VERSION})"; \
-    apk add --no-network /tmp/zlib.apk; \
+    apk add --no-network --no-logfile /tmp/zlib.apk; \
     apk info -v | grep -qx "$(basename "${ZLIB_APK}" .apk)"; \
+    test "$(sha256sum /var/log/apk.log)" = "${apklog}"; \
     cd /usr/share/grafana/data/plugins-bundled; \
     find . -mindepth 1 -maxdepth 1 ! -name canvas ! -name jaeger -exec rm -r {} +; \
     test "$(ls | tr '\n' ' ')" = "canvas jaeger "; \
     grep -q "\"version\": \"${JAEGER_DS_TAG#v}\"" jaeger/plugin.json; \
     test -x jaeger/gpx_grafana-jaeger-datasource_linux_amd64; \
-    install -o grafana -g root -m 0755 /tmp/jaeger-backend jaeger/gpx_grafana-jaeger-datasource_linux_amd64; \
+    install -m 0755 /tmp/jaeger-backend jaeger/gpx_grafana-jaeger-datasource_linux_amd64; \
     rm jaeger/MANIFEST.txt; \
+    chown -R root:root .; chmod -R u=rwX,go=rX .; \
     mkdir /usr/share/grafana/plugins; \
     unzip -q /tmp/vlogs.zip -d /usr/share/grafana/plugins; \
     cd /usr/share/grafana/plugins; \
@@ -127,10 +139,12 @@ RUN --network=none set -eu; \
     test -x victoriametrics_logs_backend_plugin_linux_amd64; \
     rm victoriametrics_logs_backend_plugin_* MANIFEST.txt; \
     install -m 0755 /tmp/vlogs-backend victoriametrics_logs_backend_plugin_linux_amd64; \
-    chown -R root:root .; chmod -R u=rwX,go=rX .; \
+    chown -R root:root /usr/share/grafana/plugins; chmod -R u=rwX,go=rX /usr/share/grafana/plugins; \
+    test -z "$(find /usr/share/grafana/plugins /usr/share/grafana/data/plugins-bundled ! -type l \( ! -user root -o -perm -0020 -o -perm -0002 \))"; \
     rm /tmp/vlogs.zip /tmp/zlib.apk /tmp/jaeger-backend /tmp/vlogs-backend /tmp/grafana-server
 
-# One layer holding the final file system: the removed files are not in the image at all.
+# One layer holds the whole final file system, so the removed files are not in the image at all.
+# (WORKDIR below adds a second, empty layer.)
 FROM scratch AS grafana
 ARG GRAFANA_IMAGE UPSTREAM_REPO UPSTREAM_TAG UPSTREAM_COMMIT UPSTREAM_FIX_COMMIT \
     UPSTREAM_PATCH_MODULE UPSTREAM_PATCH_VERSION VLOGS_DS_REPO VLOGS_DS_TAG VLOGS_DS_COMMIT VLOGS_DS_FIX_COMMIT \
@@ -145,8 +159,13 @@ ENV PATH=/usr/share/grafana/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bi
     GF_PATHS_LOGS=/var/log/grafana \
     GF_PATHS_PROVISIONING=/etc/grafana/provisioning
 # Ours. Plugins load from the read-only directory baked in above, not from the data volume; nothing is
-# installed or updated at run time and nothing calls grafana.com, stats.grafana.org or gravatar.com.
+# installed or updated at run time. The periodic calls to grafana.com, stats.grafana.org and gravatar.com
+# are switched off, and every grafana.com address the server reads points at a closed loopback port, so
+# the grafana.com proxy that any signed-in user can call (/api/gnet/*) cannot reach it either.
 ENV GF_PATHS_PLUGINS=/usr/share/grafana/plugins \
+    GF_GRAFANA_COM_URL=http://127.0.0.1:9 \
+    GF_GRAFANA_COM_API_URL=http://127.0.0.1:9/api \
+    GF_GRAFANA_NET_URL=http://127.0.0.1:9 \
     GF_PLUGINS_PREINSTALL_DISABLED=true \
     GF_PLUGINS_PLUGIN_ADMIN_ENABLED=false \
     GF_PLUGINS_PUBLIC_KEY_RETRIEVAL_DISABLED=true \
