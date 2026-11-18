@@ -2,9 +2,11 @@
 """Fail loudly when upstream has published a stable release newer than an image's base tag.
 
 For every images/*.env: list the upstream repository's GitHub releases, ignore drafts, pre-releases
-and tags that are not plain vX.Y.Z, and compare the newest with UPSTREAM_TAG.
-Exit 1 if any image has a newer upstream release (the signal to re-pin consumers to upstream's own
-image and archive this repository), 2 if a check could not be made, 0 otherwise. Opens nothing.
+and tags that are not plain vX.Y.Z, and compare the newest with UPSTREAM_TAG. Every other
+<KEY>_REPO / <KEY>_TAG pair of the definition (a component baked into the image) is checked the same way.
+Exit 1 if any image has a newer upstream release, 2 if a check could not be made, 0 otherwise.
+A newer release is the signal to re-pin consumers to upstream's own image and archive this repository,
+or, for a definition with WATCH_ACTION=rebuild, to re-pin the recipe and rebuild. Opens nothing.
 """
 import argparse
 import glob
@@ -16,6 +18,11 @@ import urllib.request
 
 SEMVER = re.compile(r"^v(\d+)\.(\d+)\.(\d+)$")
 GITHUB = re.compile(r"^https://github\.com/([\w.-]+/[\w.-]+?)(?:\.git)?$")
+# What a newer release asks for, chosen by WATCH_ACTION in the definition (default: archive).
+ACTIONS = {
+    "archive": "Check its image's Go version, re-pin to upstream's image, and archive this repository.",
+    "rebuild": "Re-pin images/{image}.env and its Dockerfile to it, rebuild and bump FC_REVISION.",
+}
 
 
 def github_releases(owner_repo, opener=urllib.request.urlopen):
@@ -49,24 +56,39 @@ def newest_stable(releases):
     return max((t for t in tags if version(t)), key=version, default=None)
 
 
-def check(name, env, fetch):
-    """Return (status, message): status 0 current, 1 newer upstream release, 2 cannot tell."""
-    repo = GITHUB.match(env.get("UPSTREAM_REPO", ""))
+def watched(env):
+    """The key prefixes to check: UPSTREAM, then every other <KEY>_REPO of the definition, sorted."""
+    return ["UPSTREAM"] + sorted(k[: -len("_REPO")] for k in env if k.endswith("_REPO") and k != "UPSTREAM_REPO")
+
+
+def check(name, env, fetch, key="UPSTREAM"):
+    """Return (status, message) for <key>_REPO at <key>_TAG: 0 current, 1 newer upstream release, 2 cannot tell."""
+    label = name if key == "UPSTREAM" else f"{name} {key}"
+    repo = GITHUB.match(env.get(f"{key}_REPO", ""))
     if not repo:
-        return 2, f"{name}: UPSTREAM_REPO is not a github.com repository"
-    base = env.get("UPSTREAM_TAG", "")
+        return 2, f"{label}: {key}_REPO is not a github.com repository"
+    base = env.get(f"{key}_TAG", "")
     if not version(base):
-        return 2, f"{name}: UPSTREAM_TAG '{base}' is not vX.Y.Z"
+        return 2, f"{label}: {key}_TAG '{base}' is not vX.Y.Z"
     try:
         newest = newest_stable(fetch(repo.group(1)))
     except (OSError, ValueError) as exc:
-        return 2, f"{name}: {exc}"
+        return 2, f"{label}: {exc}"
     if newest is None:
-        return 2, f"{name}: no stable release found in {repo.group(1)}"
+        return 2, f"{label}: no stable release found in {repo.group(1)}"
     if version(newest) > version(base):
-        return 1, (f"::error title=Upstream released {name} {newest}::{name}: base {base}, upstream released "
-                   f"{newest}. Check its image's Go version, re-pin to upstream's image, and archive this repository.")
-    return 0, f"{name}: base {base}, newest upstream release {newest}: no newer release"
+        step = ACTIONS[env.get("WATCH_ACTION", "archive")].format(image=name)
+        return 1, (f"::error title=Upstream released {label} {newest}::{label}: base {base}, upstream released "
+                   f"{newest}. {step}")
+    return 0, f"{label}: base {base}, newest upstream release {newest}: no newer release"
+
+
+def check_image(name, env, fetch):
+    """Return the (status, message) of every watched repository of one image definition."""
+    action = env.get("WATCH_ACTION", "archive")
+    if action not in ACTIONS:
+        return [(2, f"{name}: WATCH_ACTION '{action}' is not {' or '.join(sorted(ACTIONS))}")]
+    return [check(name, env, fetch, key) for key in watched(env)]
 
 
 def main(argv=None, fetch=github_releases):
@@ -80,9 +102,9 @@ def main(argv=None, fetch=github_releases):
     worst = 0
     for path in paths:
         name = os.path.basename(path)[: -len(".env")]
-        status, message = check(name, read_env(path), fetch)
-        print(message if status != 2 else f"::error title=Upstream watch failed::{message}")
-        worst = max(worst, status)
+        for status, message in check_image(name, read_env(path), fetch):
+            print(message if status != 2 else f"::error title=Upstream watch failed::{message}")
+            worst = max(worst, status)
     return worst
 
 

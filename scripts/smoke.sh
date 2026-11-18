@@ -6,6 +6,7 @@
 # Checks: the server starts and /health answers OK; `-version` and /metrics report
 # <app>-<date>-<UPSTREAM_DESCRIBE>-<FC_REVISION>; `go version -m` on the extracted binary reports
 # go<GO_VERSION> with upstream's build settings. Exit 0 only if every check passes.
+# A definition that sets SMOKE=<name> is handed to scripts/smoke-<name>.sh instead.
 set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PROBE_IMAGE=docker.io/library/busybox:1.37.0-musl@sha256:5cec3fc171c87218698e85a52af7087de727372aae264a787b8112901a5b0092
@@ -15,6 +16,7 @@ app=$1 target=$2
 [ -f "$ROOT/images/$app.env" ] || { echo "no image definition images/$app.env" >&2; exit 2; }
 # shellcheck source=/dev/null
 . "$ROOT/images/$app.env"
+[ -z "${SMOKE:-}" ] || exec "$ROOT/scripts/smoke-$SMOKE.sh" "$@"  # a definition with its own smoke test
 name="store-images-smoke-$app"
 work=$(mktemp -d)
 cleanup() {

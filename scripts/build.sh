@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build one image from images/<app>.env (linux/amd64).
+# Build one image from images/<app>.env (linux/amd64) with its DOCKERFILE (default: Dockerfile).
 #
 #   scripts/build.sh <app> archive <out.tar>    image tarball (docker + OCI layout), no attestations;
 #                                              the input to scan.sh and smoke.sh
@@ -27,10 +27,13 @@ fc_commit=$(git -C "$ROOT" rev-parse HEAD)
 [ -z "$(git -C "$ROOT" status --porcelain)" ] || fc_commit="$fc_commit-dirty"  # untracked files count
 tag="$UPSTREAM_TAG-$FC_REVISION"
 
-args=(--platform linux/amd64 --target "$APP_NAME" --file "$ROOT/Dockerfile")
+args=(--platform linux/amd64 --target "$APP_NAME" --file "$ROOT/${DOCKERFILE:-Dockerfile}")
 for v in APP_NAME UPSTREAM_REPO UPSTREAM_TAG UPSTREAM_COMMIT UPSTREAM_DESCRIBE UPSTREAM_GO_FIX_COMMIT \
-         GO_VERSION FC_REVISION DOCS_URL; do
-  args+=(--build-arg "$v=${!v}")
+         GO_VERSION FC_REVISION DOCS_URL \
+         VLOGS_DS_REPO VLOGS_DS_TAG VLOGS_DS_COMMIT VLOGS_DS_FIX_COMMIT VLOGS_DS_BUILD_TIME \
+         JAEGER_DS_REPO JAEGER_DS_TAG JAEGER_DS_COMMIT JAEGER_DS_FIX_COMMIT JAEGER_DS_BUILD_TIME \
+         XNET_VERSION COMPRESS_VERSION; do
+  [ -z "${!v+set}" ] || args+=(--build-arg "$v=${!v}")  # a definition sets only what its Dockerfile reads
 done
 args+=(--build-arg "FC_COMMIT=$fc_commit"
        --build-arg "BUILD_DATE=$(date -u -d "@$SOURCE_DATE_EPOCH" +%Y%m%d-%H%M%S)"

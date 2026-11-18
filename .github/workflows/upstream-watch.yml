@@ -2,7 +2,8 @@ name: upstream-watch
 
 # Weekly: fail loudly if VictoriaLogs or VictoriaTraces has published a stable release newer than
 # the tag we rebuild. That is the signal to re-pin consumers to upstream's own image and archive
-# this repository. Opens nothing, writes nothing.
+# this repository. For Grafana, a newer release of Grafana, of the VictoriaLogs data source or of the
+# Jaeger data source is the signal to re-pin the recipe and rebuild. Opens nothing, writes nothing.
 on:
   schedule:
     - cron: "17 13 * * 1"

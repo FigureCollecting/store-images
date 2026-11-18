@@ -1,0 +1,152 @@
+# Grafana OSS for the internal log and trace viewer: upstream's image, pinned by digest, with
+#   - victoriametrics-logs-datasource baked in from its release zip (pinned version, sha256-verified);
+#   - every bundled data source we do not use removed (only Jaeger stays: it reads VictoriaTraces'
+#     /select/jaeger), and the image flattened so the removed files are in no layer;
+#   - the backends of the two data sources rebuilt from their release tags with the dependency fixes
+#     upstream has on main but has not released (patches/grafana-jaeger.patch, patches/grafana-vlogs.patch),
+#     using the flags of upstream's own release binaries; nothing else of the plugins is changed;
+#   - Alpine's zlib moved to the fixed package (pinned file, sha256-verified);
+#   - telemetry, update checks, the news feed, the plugin catalog and run-time plugin installs off by default.
+# Build arguments come from images/grafana.env via scripts/build.sh; target = grafana.
+# Every RUN has no network, except the four that fetch a pinned source tree or its go.sum-verified modules.
+ARG GRAFANA_IMAGE=docker.io/grafana/grafana:13.3.1@sha256:0615ec4fbd4072004b7d86b46ded63013a74b7d6eb1119273dd89e8fa25c13cf
+ARG GO_IMAGE=docker.io/library/golang:1.27.3@sha256:2669ec97bbb6e54602952b4171211116e3fe90e5f9c47619920c74554b3d7d09
+ARG VLOGS_DS_ZIP=https://github.com/VictoriaMetrics/victorialogs-datasource/releases/download/v0.34.0/victoriametrics-logs-datasource-v0.34.0.zip
+ARG VLOGS_DS_SHA256=sha256:6fc61446097a525e826f2ddb6746723f85447845c95a7b1a99624e84d4b2e237
+ARG ZLIB_APK=https://dl-cdn.alpinelinux.org/alpine/v3.24/main/x86_64/zlib-1.4-r0.apk
+ARG ZLIB_SHA256=sha256:7b05bc778b8b25cd880835b40114182bd4d1581717504d0129c810c0a14291cb
+
+FROM ${GO_IMAGE} AS go
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+ARG GO_VERSION
+ENV GOTOOLCHAIN=local GOFLAGS=-mod=readonly CGO_ENABLED=0 GOOS=linux GOARCH=amd64 GOAMD64=v1
+RUN --network=none test "$(go env GOVERSION)" = "go${GO_VERSION}"
+WORKDIR /src
+
+# Jaeger data source backend: its release tag with golang.org/x/net moved to the fixed version.
+FROM go AS jaeger
+ARG JAEGER_DS_REPO JAEGER_DS_TAG JAEGER_DS_COMMIT JAEGER_DS_BUILD_TIME XNET_VERSION
+RUN git -c advice.detachedHead=false clone --quiet --depth 1 --branch "${JAEGER_DS_TAG}" "${JAEGER_DS_REPO}" . \
+ && test "$(git rev-parse HEAD)" = "${JAEGER_DS_COMMIT}"
+COPY patches/grafana-jaeger.patch /tmp/deps.patch
+RUN --network=none git apply --check /tmp/deps.patch && git apply /tmp/deps.patch \
+ && test "$(git diff --numstat | tr '\t\n' '  ')" = "1 1 go.mod 2 2 go.sum " \
+ && grep -qxP "\tgolang.org/x/net ${XNET_VERSION} // indirect" go.mod
+RUN go mod download
+RUN --network=none GOPROXY=off go build -tags arrow_json_stdlib \
+      -ldflags "-w -s -extldflags \"-static\" -X 'github.com/grafana/grafana-plugin-sdk-go/build/buildinfo.buildInfoJSON={\"time\":${JAEGER_DS_BUILD_TIME},\"pluginID\":\"jaeger\",\"version\":\"${JAEGER_DS_TAG#v}\"}' -X 'main.pluginID=jaeger' -X 'main.version=${JAEGER_DS_TAG#v}'" \
+      -o /out/backend ./pkg \
+ && go version -m /out/backend >/tmp/buildinfo \
+ && grep -qP "^\tdep\tgolang.org/x/net\t${XNET_VERSION}\t" /tmp/buildinfo \
+ && grep -qP "^\tbuild\tvcs.revision=${JAEGER_DS_COMMIT}$" /tmp/buildinfo \
+ && test "$(git status --porcelain --untracked-files=no | tr '\n' ' ')" = " M go.mod  M go.sum "
+
+# VictoriaLogs data source backend: its release tag with golang.org/x/net (and the golang.org/x/sys and
+# golang.org/x/text it requires) and klauspost/compress moved to fixed versions, built with the fixed Go.
+# The tag vendors its modules; the patched go.mod is built from the module cache instead (-mod=readonly).
+FROM go AS vlogs
+ARG VLOGS_DS_REPO VLOGS_DS_TAG VLOGS_DS_COMMIT VLOGS_DS_BUILD_TIME XNET_VERSION COMPRESS_VERSION
+RUN git -c advice.detachedHead=false clone --quiet --depth 1 --branch "${VLOGS_DS_TAG}" "${VLOGS_DS_REPO}" . \
+ && test "$(git rev-parse HEAD)" = "${VLOGS_DS_COMMIT}"
+COPY patches/grafana-vlogs.patch /tmp/deps.patch
+RUN --network=none git apply --check /tmp/deps.patch && git apply /tmp/deps.patch \
+ && test "$(git diff --numstat | tr '\t\n' '  ')" = "4 4 go.mod 8 8 go.sum " \
+ && grep -qxP "\tgolang.org/x/net ${XNET_VERSION} // indirect" go.mod \
+ && grep -qxP "\tgithub.com/klauspost/compress ${COMPRESS_VERSION}" go.mod
+RUN go mod download
+RUN --network=none GOPROXY=off go build -tags arrow_json_stdlib \
+      -ldflags "-w -s -extldflags \"-static\" -X 'github.com/grafana/grafana-plugin-sdk-go/build/buildinfo.buildInfoJSON={\"time\":${VLOGS_DS_BUILD_TIME},\"pluginID\":\"victoriametrics-logs-datasource\",\"version\":\"${VLOGS_DS_TAG#v}\"}' -X 'main.pluginID=victoriametrics-logs-datasource' -X 'main.version=${VLOGS_DS_TAG#v}'" \
+      -o /out/backend ./pkg \
+ && go version -m /out/backend >/tmp/buildinfo \
+ && grep -qP "^\tdep\tgolang.org/x/net\t${XNET_VERSION}\t" /tmp/buildinfo \
+ && grep -qP "^\tdep\tgithub.com/klauspost/compress\t${COMPRESS_VERSION}\t" /tmp/buildinfo \
+ && grep -qP "^\tbuild\tvcs.revision=${VLOGS_DS_COMMIT}$" /tmp/buildinfo \
+ && test "$(git status --porcelain --untracked-files=no | tr '\n' ' ')" = " M go.mod  M go.sum "
+
+FROM ${GRAFANA_IMAGE} AS rootfs
+ARG UPSTREAM_TAG VLOGS_DS_TAG JAEGER_DS_TAG VLOGS_DS_ZIP VLOGS_DS_SHA256 ZLIB_APK ZLIB_SHA256
+USER root
+ADD --checksum=${VLOGS_DS_SHA256} ${VLOGS_DS_ZIP} /tmp/vlogs.zip
+ADD --checksum=${ZLIB_SHA256} ${ZLIB_APK} /tmp/zlib.apk
+COPY --from=jaeger /out/backend /tmp/jaeger-backend
+COPY --from=vlogs /out/backend /tmp/vlogs-backend
+# A rebuilt backend no longer matches its plugin's signed MANIFEST.txt, so the manifest goes and the two
+# plugins are allowed to load unsigned below. The VictoriaLogs zip also carries backends for other
+# platforms, which are removed.
+RUN --network=none set -eu; \
+    test "$(grafana --version)" = "grafana version ${UPSTREAM_TAG#v}"; \
+    apk add --no-network /tmp/zlib.apk; \
+    apk info -v | grep -qx "$(basename "${ZLIB_APK}" .apk)"; \
+    cd /usr/share/grafana/data/plugins-bundled; \
+    find . -mindepth 1 -maxdepth 1 ! -name canvas ! -name jaeger -exec rm -r {} +; \
+    test "$(ls | tr '\n' ' ')" = "canvas jaeger "; \
+    grep -q "\"version\": \"${JAEGER_DS_TAG#v}\"" jaeger/plugin.json; \
+    test -x jaeger/gpx_grafana-jaeger-datasource_linux_amd64; \
+    install -o grafana -g root -m 0755 /tmp/jaeger-backend jaeger/gpx_grafana-jaeger-datasource_linux_amd64; \
+    rm jaeger/MANIFEST.txt; \
+    mkdir /usr/share/grafana/plugins; \
+    unzip -q /tmp/vlogs.zip -d /usr/share/grafana/plugins; \
+    cd /usr/share/grafana/plugins; \
+    test "$(ls | tr '\n' ' ')" = "victoriametrics-logs-datasource "; \
+    cd victoriametrics-logs-datasource; \
+    grep -q "\"version\": \"${VLOGS_DS_TAG#v}\"" plugin.json; \
+    test -x victoriametrics_logs_backend_plugin_linux_amd64; \
+    rm victoriametrics_logs_backend_plugin_* MANIFEST.txt; \
+    install -m 0755 /tmp/vlogs-backend victoriametrics_logs_backend_plugin_linux_amd64; \
+    chown -R root:root .; chmod -R u=rwX,go=rX .; \
+    rm /tmp/vlogs.zip /tmp/zlib.apk /tmp/jaeger-backend /tmp/vlogs-backend
+
+# One layer holding the final file system: the removed files are not in the image at all.
+FROM scratch AS grafana
+ARG GRAFANA_IMAGE UPSTREAM_REPO UPSTREAM_TAG VLOGS_DS_REPO VLOGS_DS_TAG VLOGS_DS_COMMIT VLOGS_DS_FIX_COMMIT \
+    JAEGER_DS_REPO JAEGER_DS_TAG JAEGER_DS_COMMIT JAEGER_DS_FIX_COMMIT XNET_VERSION COMPRESS_VERSION \
+    GO_VERSION FC_REVISION FC_COMMIT CREATED DOCS_URL
+COPY --from=rootfs / /
+# Upstream's runtime settings, restated because the image starts from scratch.
+ENV PATH=/usr/share/grafana/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+    GF_PATHS_CONFIG=/etc/grafana/grafana.ini \
+    GF_PATHS_DATA=/var/lib/grafana \
+    GF_PATHS_HOME=/usr/share/grafana \
+    GF_PATHS_LOGS=/var/log/grafana \
+    GF_PATHS_PROVISIONING=/etc/grafana/provisioning
+# Ours. Plugins load from the read-only directory baked in above, not from the data volume; nothing is
+# installed or updated at run time and nothing calls grafana.com, stats.grafana.org or gravatar.com.
+ENV GF_PATHS_PLUGINS=/usr/share/grafana/plugins \
+    GF_PLUGINS_PREINSTALL_DISABLED=true \
+    GF_PLUGINS_PLUGIN_ADMIN_ENABLED=false \
+    GF_PLUGINS_PUBLIC_KEY_RETRIEVAL_DISABLED=true \
+    GF_PLUGINS_ALLOW_LOADING_UNSIGNED_PLUGINS=jaeger,victoriametrics-logs-datasource \
+    GF_ANALYTICS_REPORTING_ENABLED=false \
+    GF_ANALYTICS_CHECK_FOR_UPDATES=false \
+    GF_ANALYTICS_CHECK_FOR_PLUGIN_UPDATES=false \
+    GF_ANALYTICS_FEEDBACK_LINKS_ENABLED=false \
+    GF_NEWS_NEWS_FEED_ENABLED=false \
+    GF_SECURITY_DISABLE_GRAVATAR=true \
+    GF_SNAPSHOTS_EXTERNAL_ENABLED=false
+LABEL org.opencontainers.image.source="https://github.com/FigureCollecting/store-images" \
+      org.opencontainers.image.revision="${FC_COMMIT}" \
+      org.opencontainers.image.version="${UPSTREAM_TAG}-${FC_REVISION}" \
+      org.opencontainers.image.created="${CREATED}" \
+      org.opencontainers.image.title="grafana" \
+      org.opencontainers.image.description="Grafana OSS ${UPSTREAM_TAG} with victoriametrics-logs-datasource ${VLOGS_DS_TAG} and Jaeger ${JAEGER_DS_TAG}, their backends rebuilt with Go ${GO_VERSION} and fixed dependencies; unused data sources removed" \
+      org.opencontainers.image.documentation="${DOCS_URL}" \
+      org.opencontainers.image.licenses="AGPL-3.0-only" \
+      org.opencontainers.image.vendor="FigureCollecting" \
+      org.opencontainers.image.base.name="${GRAFANA_IMAGE}" \
+      com.figurecollecting.upstream.source="${UPSTREAM_REPO}" \
+      com.figurecollecting.upstream.tag="${UPSTREAM_TAG}" \
+      com.figurecollecting.go.version="${GO_VERSION}" \
+      com.figurecollecting.x-net.version="${XNET_VERSION}" \
+      com.figurecollecting.compress.version="${COMPRESS_VERSION}" \
+      com.figurecollecting.vlogs-datasource.source="${VLOGS_DS_REPO}" \
+      com.figurecollecting.vlogs-datasource.tag="${VLOGS_DS_TAG}" \
+      com.figurecollecting.vlogs-datasource.commit="${VLOGS_DS_COMMIT}" \
+      com.figurecollecting.vlogs-datasource.fix-commit="${VLOGS_DS_FIX_COMMIT}" \
+      com.figurecollecting.jaeger-datasource.source="${JAEGER_DS_REPO}" \
+      com.figurecollecting.jaeger-datasource.tag="${JAEGER_DS_TAG}" \
+      com.figurecollecting.jaeger-datasource.commit="${JAEGER_DS_COMMIT}" \
+      com.figurecollecting.jaeger-datasource.fix-commit="${JAEGER_DS_FIX_COMMIT}"
+USER 472
+WORKDIR /usr/share/grafana
+EXPOSE 3000
+ENTRYPOINT ["/run.sh"]

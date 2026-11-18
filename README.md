@@ -7,8 +7,11 @@ to the patch release that upstream has already adopted on its main branch. Nothi
 The images are published as `ghcr.io/figurecollecting/victoria-logs` and
 `ghcr.io/figurecollecting/victoria-traces`, tagged `<upstream tag>-fc<N>`.
 
-This repository will be archived once upstream publishes releases built with the fixed Go version.
-At that point, consumers pin upstream's own images again.
+This repository will be archived once upstream publishes releases built with the fixed Go version
+and it holds no other image we use. At that point, consumers pin upstream's own images again.
+
+It also holds the recipe for our Grafana image, `ghcr.io/figurecollecting/grafana` (see
+[Grafana](#grafana)). The recipe is public; the image is internal and its package stays private.
 
 ## What is rebuilt
 
@@ -17,18 +20,53 @@ At that point, consumers pin upstream's own images again.
 | victoria-logs | v1.53.0 (915d91904b) | 1.27.1 | 1.27.3 | VictoriaLogs 06d56702 |
 | victoria-traces | v0.12.1 (7b13fef2f) | 1.27.2 | 1.27.3 | VictoriaTraces 8586f7c8 |
 
+## Grafana
+
+`Dockerfile.grafana` starts from upstream's Grafana OSS image, pinned by digest, and changes five things:
+
+- `victoriametrics-logs-datasource` is baked in from its release zip (pinned version, sha256-verified)
+  into `/usr/share/grafana/plugins`, which the Grafana user cannot write.
+- Every bundled data source we do not use is removed. Jaeger stays, because it reads VictoriaTraces'
+  `/select/jaeger`. The image is flattened to one layer, so the removed files are in no layer.
+- The backends of the two data sources are rebuilt from their release tags with Go 1.27.3 and the
+  dependency fixes upstream has on main but has not released (`patches/grafana-jaeger.patch`,
+  `patches/grafana-vlogs.patch`), with the flags of upstream's own binaries. A rebuilt backend no
+  longer matches its plugin's signature manifest, so the manifest is removed and these two plugins,
+  and no others, are allowed to load unsigned.
+- Alpine's `zlib` is moved to the fixed package (a pinned, sha256-verified file).
+- Defaults, set as environment variables so that a mounted `grafana.ini` does not undo them: no usage
+  reporting, no update checks for Grafana or plugins, no news feed, no plugin catalog, no preinstalled
+  or run-time plugin installs, no gravatar, no external snapshots. Nothing calls grafana.com.
+
+| Component | Upstream | Ours |
+|---|---|---|
+| Grafana OSS | v13.3.1 | unchanged binary, non-root as upstream (uid 472) |
+| victoriametrics-logs-datasource | v0.34.0 (a5450dee43): Go 1.27.2, x/net v0.60.0, compress v1.19.2 | Go 1.27.3, x/net v0.62.0, compress v1.20.4 (upstream 2d682142, 12c4778f on main) |
+| Jaeger data source | v13.0.8 (7bf6c164d5): x/net v0.61.0 | x/net v0.62.0 (upstream cb0d47d1 on main) |
+| zlib (Alpine 3.24) | 1.3.2-r1 | 1.4-r0 |
+
+Known gap: Grafana v13.3.1's own binary carries `github.com/apache/thrift` v0.24.0, which grype
+reports (fixed in v0.25.0; upstream's `release-13.3.2` branch has it). The scan gate fails on it until
+the recipe moves to a Grafana release with the fix.
+
+Go back to a plugin's own signed backend when its upstream releases one with the fixes.
+
 ## Layout
 
 - `images/<app>.env`: the definition (upstream repo, tag, commit, Go version, our `FC_REVISION`).
+  A definition may name its own `DOCKERFILE` and `SMOKE` test.
 - `patches/<app>.patch`: the only source change, the `go` line in `go.mod` and `GO_BUILDER_IMAGE` in
-  `deployment/docker/Makefile`, as in upstream's fix commit.
+  `deployment/docker/Makefile`, as in upstream's fix commit. `patches/grafana-*.patch` change only
+  module versions in `go.mod` and their `go.sum` lines.
 - `Dockerfile`: upstream's linux/amd64 build (`-trimpath`, static, `netgo osusergo`, CGO on as upstream
   does for amd64, same distroless runtime pin, same binary path), with the builder and runtime pinned by
   digest. The build checks the upstream commit, the patch and the resulting Go version.
 - `scripts/build.sh` builds; `scripts/scan.sh` runs trivy and grype; `scripts/gate.py` fails on any
   HIGH or CRITICAL finding that has a fix, from either scanner, with no ignore list; `scripts/smoke.sh`
   runs the image and checks `/health`, the version string and `go version -m`;
-  `scripts/upstream_watch.py` reports a newer upstream release.
+  `scripts/smoke-grafana.sh` runs Grafana with no network and checks health, the plugins, the defaults
+  and that nothing tried to reach the outside; `scripts/check_pins.py` fails on a base image without a
+  digest or a download without a checksum; `scripts/upstream_watch.py` reports a newer upstream release.
 
 ## Local use
 
@@ -40,11 +78,14 @@ At that point, consumers pin upstream's own images again.
 
 ## CI
 
-- Pull requests: unit tests, then build, scan gate and smoke for both images. No push, no secrets.
+- Pull requests: unit tests and the pin check, then build, scan gate and smoke for every image. No
+  push, no secrets.
 - Push to `main`: the same, then publish. The image is pushed by digest with SBOM and provenance
   attestations, its linux/amd64 manifest is checked against the one that was scanned, and only then is
   it tagged. An existing tag is never overwritten; bump `FC_REVISION` to publish a new build.
 - Weekly `upstream-watch`: fails if upstream has a stable release newer than our base tag. That is the
   signal to re-pin consumers to upstream's image (check that its Go is fixed) and archive this repo.
+  For Grafana it also watches the two data sources, and a newer release means re-pin and rebuild.
 
-Consumers pin by digest. The packages must be public for anonymous pulls.
+Consumers pin by digest. The VictoriaLogs and VictoriaTraces packages must be public for anonymous
+pulls; the Grafana package is private and is pulled with a pull secret.

@@ -11,6 +11,9 @@ import upstream_watch  # noqa: E402
 
 VL = "UPSTREAM_REPO=https://github.com/VictoriaMetrics/VictoriaLogs\nUPSTREAM_TAG=v1.53.0\n"
 VT = "# comment\nAPP_NAME=victoria-traces\nUPSTREAM_REPO=https://github.com/VictoriaMetrics/VictoriaTraces\nUPSTREAM_TAG=v0.12.1\n"
+GF = ("APP_NAME=grafana\nUPSTREAM_REPO=https://github.com/grafana/grafana\nUPSTREAM_TAG=v13.3.1\nWATCH_ACTION=rebuild\n"
+      "VLOGS_DS_REPO=https://github.com/VictoriaMetrics/victorialogs-datasource\nVLOGS_DS_TAG=v0.34.0\n"
+      "JAEGER_DS_REPO=https://github.com/grafana/grafana-jaeger-datasource\nJAEGER_DS_TAG=v13.0.8\n")
 
 
 def rel(tag, draft=False, prerelease=False):
@@ -105,6 +108,69 @@ class WatchTest(unittest.TestCase):
         rc, out = self.run_watch({"VictoriaMetrics/VictoriaLogs": [rel("v1.53.0")]})
         self.assertEqual(rc, 2)
         self.assertIn("victoria-logs: UPSTREAM_TAG 'main' is not vX.Y.Z", out)
+
+    def test_every_repo_and_tag_pair_of_a_definition_is_watched(self):
+        self.images(grafana=GF)
+        rc, out = self.run_watch({"grafana/grafana": [rel("v13.3.1"), rel("v13.2.6"), rel("v12.4.15")],
+                                  "VictoriaMetrics/victorialogs-datasource": [rel("v0.34.0")],
+                                  "grafana/grafana-jaeger-datasource": [rel("v13.0.8")]})
+        self.assertEqual(rc, 0, out)
+        self.assertIn("grafana: base v13.3.1, newest upstream release v13.3.1: no newer release", out)
+        self.assertIn("grafana VLOGS_DS: base v0.34.0, newest upstream release v0.34.0: no newer release", out)
+        self.assertIn("grafana JAEGER_DS: base v13.0.8, newest upstream release v13.0.8: no newer release", out)
+        self.assertEqual(sorted(self.calls), ["VictoriaMetrics/victorialogs-datasource", "grafana/grafana",
+                                              "grafana/grafana-jaeger-datasource"])
+
+    def test_a_newer_baked_in_component_fails_with_the_rebuild_step(self):
+        self.images(grafana=GF)
+        rc, out = self.run_watch({"grafana/grafana": [rel("v13.3.1")],
+                                  "VictoriaMetrics/victorialogs-datasource": [rel("v0.34.0")],
+                                  "grafana/grafana-jaeger-datasource": [rel("v13.0.9"), rel("v13.0.8")]})
+        self.assertEqual(rc, 1)
+        self.assertIn("::error title=Upstream released grafana JAEGER_DS v13.0.9::grafana JAEGER_DS: base v13.0.8, "
+                      "upstream released v13.0.9. Re-pin images/grafana.env and its Dockerfile to it, rebuild and "
+                      "bump FC_REVISION.", out)
+        self.assertNotIn("archive this repository", out)
+        self.assertIn("grafana: base v13.3.1, newest upstream release v13.3.1: no newer release", out)
+
+    def test_a_newer_base_release_of_a_rebuild_definition_asks_for_a_rebuild(self):
+        self.images(grafana=GF, victoria_logs=VL)
+        rc, out = self.run_watch({"grafana/grafana": [rel("v13.3.2"), rel("v14.0.0", prerelease=True)],
+                                  "VictoriaMetrics/victorialogs-datasource": [rel("v0.34.0")],
+                                  "grafana/grafana-jaeger-datasource": [rel("v13.0.8")],
+                                  "VictoriaMetrics/VictoriaLogs": [rel("v1.54.0")]})
+        self.assertEqual(rc, 1)
+        self.assertIn("::error title=Upstream released grafana v13.3.2::grafana: base v13.3.1, upstream released "
+                      "v13.3.2. Re-pin images/grafana.env and its Dockerfile to it, rebuild and bump FC_REVISION.", out)
+        self.assertIn("victoria-logs: base v1.53.0, upstream released v1.54.0. Check its image's Go version, "
+                      "re-pin to upstream's image, and archive this repository.", out)
+
+    def test_a_repo_without_its_tag_is_an_error(self):
+        self.images(grafana="UPSTREAM_REPO=https://github.com/grafana/grafana\nUPSTREAM_TAG=v13.3.1\n"
+                            "VLOGS_DS_REPO=https://github.com/VictoriaMetrics/victorialogs-datasource\n"
+                            "JAEGER_DS_REPO=git@github.com:grafana/grafana-jaeger-datasource\nJAEGER_DS_TAG=v13.0.8\n")
+        rc, out = self.run_watch({"grafana/grafana": [rel("v13.3.1")]})
+        self.assertEqual(rc, 2)
+        self.assertIn("::error title=Upstream watch failed::grafana VLOGS_DS: VLOGS_DS_TAG '' is not vX.Y.Z", out)
+        self.assertIn("grafana JAEGER_DS: JAEGER_DS_REPO is not a github.com repository", out)
+        self.assertIn("grafana: base v13.3.1, newest upstream release v13.3.1: no newer release", out)
+
+    def test_an_unknown_watch_action_is_an_error(self):
+        self.images(grafana=GF.replace("WATCH_ACTION=rebuild", "WATCH_ACTION=ignore"))
+        rc, out = self.run_watch({})
+        self.assertEqual(rc, 2)
+        self.assertIn("::error title=Upstream watch failed::grafana: WATCH_ACTION 'ignore' is not archive or rebuild", out)
+        self.assertEqual(self.calls, [])
+
+    def test_the_grafana_definition_in_this_repository_watches_all_three_upstreams(self):
+        env = upstream_watch.read_env(os.path.join(os.path.dirname(__file__), "..", "images", "grafana.env"))
+        self.assertEqual(env.get("WATCH_ACTION"), "rebuild")
+        self.assertEqual([(key, env[f"{key}_REPO"]) for key in upstream_watch.watched(env)],
+                         [("UPSTREAM", "https://github.com/grafana/grafana"),
+                          ("JAEGER_DS", "https://github.com/grafana/grafana-jaeger-datasource"),
+                          ("VLOGS_DS", "https://github.com/VictoriaMetrics/victorialogs-datasource")])
+        for key in upstream_watch.watched(env):
+            self.assertIsNotNone(upstream_watch.version(env[f"{key}_TAG"]), key)
 
     def test_no_image_definitions_is_an_error(self):
         rc, out = self.run_watch({})
