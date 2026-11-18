@@ -234,6 +234,12 @@ class MainTest(unittest.TestCase):
         rc, out = self.run_main()
         self.assertEqual(rc, 0, out)
 
+    def test_a_directory_named_like_a_definition_is_skipped(self):
+        self.write("Dockerfile", PINNED)
+        os.makedirs(os.path.join(self.tmp.name, "images", "odd.env"))
+        rc, out = self.run_main()
+        self.assertEqual(rc, 0, out)
+
     def test_a_definition_that_names_the_default_dockerfile_does_not_check_it_twice(self):
         self.write("Dockerfile", PINNED)
         os.makedirs(os.path.join(self.tmp.name, "images"))

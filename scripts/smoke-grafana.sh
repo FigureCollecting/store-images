@@ -136,10 +136,10 @@ check plugin-files "${writable:-?} of ${files:-?} plugin files and directories a
   test "${writable:-1}" = 0 -a "${files:-0}" -gt 50
 # shellcheck disable=SC2016  # expanded by the shell inside the container
 tamper=$(docker exec "$name" sh -c 'd=/usr/share/grafana/data/plugins-bundled/jaeger
-  { echo "// x" >>"$d/module.js"; } 2>/dev/null && echo "module.js WRITTEN"
-  { rm -f "$d/plugin.json"; } 2>/dev/null; [ -e "$d/plugin.json" ] || echo "plugin.json REMOVED"
-  { mv "$d" "$d.x"; } 2>/dev/null && echo "directory RENAMED"
-  { : >/usr/share/grafana/data/plugins-bundled/new; } 2>/dev/null && echo "sibling CREATED"
+  ( echo "// x" >>"$d/module.js" ) 2>/dev/null && echo "module.js WRITTEN"
+  ( rm -f "$d/plugin.json" ) 2>/dev/null; [ -e "$d/plugin.json" ] || echo "plugin.json REMOVED"
+  ( mv "$d" "$d.x" ) 2>/dev/null && echo "directory RENAMED"
+  ( touch /usr/share/grafana/data/plugins-bundled/new ) 2>/dev/null && echo "sibling CREATED"
   echo done' 2>/dev/null | tr '\n' ' ')
 check plugin-tamper "as the running user, change the Jaeger plugin: '${tamper:-no answer}'" test "$tamper" = "done "
 backends=$(docker exec "$name" find / -xdev -type f \( -name 'gpx_*' -o -name '*_backend_plugin_*' \) 2>/dev/null | sort | tr '\n' ' ')
