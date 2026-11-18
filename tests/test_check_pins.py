@@ -160,6 +160,14 @@ class DockerfileTest(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertEqual(self.problems(text), [])
 
+    def test_a_byte_order_mark_does_not_hide_the_syntax_directive(self):
+        got = self.problems(f"\ufeff# syntax=docker/dockerfile:1\nFROM x@{D}\n")
+        self.assertEqual(got, ["line 1: # syntax=docker/dockerfile:1 is not pinned by digest (@sha256:<64 hex>)"])
+        self.assertEqual(self.problems(f"\ufeff# syntax=docker/dockerfile:1@{D}\nFROM x@{D}\n"), [])
+
+    def test_a_file_of_directives_only_has_no_frontend_and_no_from(self):
+        self.assertEqual(self.problems("# escape=`\n# check=skip=all\n"), ["no FROM instruction"])
+
 
 class MainTest(unittest.TestCase):
     def setUp(self):

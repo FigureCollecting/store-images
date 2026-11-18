@@ -7,8 +7,9 @@
 # reach the outside shows up in its log as a failed dial. Checks: it runs as the non-root upstream
 # user; /api/health is OK at the pinned version; the baked-in plugins are listed, the only external
 # ones, and their backends answer and are the rebuilt binaries (`go version -m`); telemetry, update
-# checks, the news feed, the plugin catalog and runtime plugin installs are off; and the log holds
-# no outbound attempt.
+# checks, the news feed, the plugin catalog, runtime plugin installs and Cloud Migration are off; the
+# running user can write nothing outside the data, log and temp paths; and the log holds no outbound
+# attempt.
 # Exit 0 only if every check passes.
 set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -104,6 +105,7 @@ done <<'EOF'
 .plugins.public_key_retrieval_disabled true
 .security.disable_gravatar true
 .snapshots.external_enabled false
+.cloud_migration.enabled false
 .grafana_com.url http://127.0.0.1:9
 .grafana_com.api_url http://127.0.0.1:9/api
 .grafana_net.url http://127.0.0.1:9
@@ -117,6 +119,15 @@ docker logs "$name" 2>&1 | tail -n "+$((before + 1))" >"$work/gnet.log"
 tried=$(grep -cE 'lookup |no such host|network is unreachable|grafana\.(com|net)' "$work/gnet.log")
 check gnet "GET /api/gnet/plugins -> HTTP ${gnet:-none}, ${tried} attempts to reach grafana.com logged" \
   test "$tried" = 0 -a -n "$gnet" -a "$gnet" != 200
+# Cloud Migration dials a host taken from a pasted token, so its endpoints must not exist at all.
+token=$(printf '%s' '{"Token":"glc_smoke","Instance":{"StackID":1,"Slug":"smoke","RegionSlug":"smoke","ClusterSlug":"smoke-0"}}' | base64 -w0)
+before=$(docker logs "$name" 2>&1 | wc -l)
+migrate=$(api /api/cloudmigration/migration -X POST -H 'Content-Type: application/json' -d "{\"authToken\":\"$token\"}" -o /dev/null -w '%{http_code}')
+sleep 2
+docker logs "$name" 2>&1 | tail -n "+$((before + 1))" >"$work/migrate.log"
+tried=$(grep -cE 'lookup |no such host|network is unreachable|dial tcp|grafana\.(com|net)' "$work/migrate.log")
+check cloud-migration "POST /api/cloudmigration/migration with a token -> HTTP ${migrate:-none}, ${tried} attempts to reach its host logged" \
+  test "$tried" = 0 -a "$migrate" = 404
 frontend=$(api /api/frontend/settings)
 got=$(jq -c '{hasUpdate: .buildInfo.hasUpdate, latestVersion: .buildInfo.latestVersion, newsFeedEnabled, pluginAdminEnabled, preinstalled: (.pluginCatalogPreinstalledPlugins | length)}' <<<"$frontend" 2>/dev/null)
 check frontend "/api/frontend/settings ${got:-no answer}" \
@@ -142,6 +153,18 @@ tamper=$(docker exec "$name" sh -c 'd=/usr/share/grafana/data/plugins-bundled/ja
   ( touch /usr/share/grafana/data/plugins-bundled/new ) 2>/dev/null && echo "sibling CREATED"
   echo done' 2>/dev/null | tr '\n' ' ')
 check plugin-tamper "as the running user, change the Jaeger plugin: '${tamper:-no answer}'" test "$tamper" = "done "
+# The same holds for the rest of the image: the entrypoint runs at every start, and provisioning files are
+# applied at every start. Outside the data, log and temp paths, the running user owns nothing and neither
+# its group nor group 0 nor "other" can write anything.
+# shellcheck disable=SC2016  # expanded by the shell inside the container
+loose=$(docker exec "$name" sh -c 'find / -xdev \( -path /proc -o -path /sys -o -path /dev -o -path /tmp -o -path /var/tmp -o -path "$GF_PATHS_DATA" -o -path "$GF_PATHS_LOGS" \) -prune -o ! -type l \( -user "$(id -u)" -o -group "$(id -g)" -perm -0020 -o -group 0 -perm -0020 -o -perm -0002 \) -print' 2>/dev/null)
+seen=$(docker exec "$name" sh -c 'find / -xdev | wc -l' 2>/dev/null)
+check writable "$(grep -c . <<<"$loose") of ${seen:-?} paths outside the data, log and temp paths are writable by the running user or group 0: '$(head -n 5 <<<"$loose" | tr '\n' ' ')'" \
+  test -z "$loose" -a "${seen:-0}" -gt 1000
+entry=$(docker image inspect --format '{{join .Config.Entrypoint " "}}' "$img" 2>/dev/null)
+# shellcheck disable=SC2016  # expanded by the shell inside the container
+mode=$(docker exec "$name" sh -c 'echo "$(stat -c "%u:%g %a" "$1") $([ -w "$1" ] && echo writable || echo read-only)"' sh "$entry" 2>/dev/null)
+check entrypoint "${entry:-none} is '${mode:-no answer}' for the running user" test "$entry" = /run.sh -a "$mode" = "0:0 755 read-only"
 backends=$(docker exec "$name" find / -xdev -type f \( -name 'gpx_*' -o -name '*_backend_plugin_*' \) 2>/dev/null | sort | tr '\n' ' ')
 jaeger_bin=/usr/share/grafana/data/plugins-bundled/jaeger/gpx_grafana-jaeger-datasource_linux_amd64
 vlogs_bin=/usr/share/grafana/plugins/victoriametrics-logs-datasource/victoriametrics_logs_backend_plugin_linux_amd64

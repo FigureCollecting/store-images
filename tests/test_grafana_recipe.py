@@ -84,6 +84,40 @@ class ServerRebuildTest(unittest.TestCase):
         self.assertIn("/usr/share/grafana/plugins /usr/share/grafana/data/plugins-bundled ! -type l "
                       "\\( ! -user root -o -perm -0020 -o -perm -0002 \\)", text)
 
+    def test_cloud_migration_is_off_and_the_smoke_test_asks_the_server(self):
+        self.assertIn("    GF_CLOUD_MIGRATION_ENABLED=false \\\n", read("Dockerfile.grafana"))
+        smoke = read("scripts/smoke-grafana.sh")
+        self.assertIn("\n.cloud_migration.enabled false\n", smoke)
+        self.assertIn("api /api/cloudmigration/migration -X POST", smoke)
+
+    def test_every_default_of_ours_is_listed_in_the_readme_and_read_back_by_the_smoke_test(self):
+        text = read("Dockerfile.grafana")
+        ours = text.split("ENV GF_PATHS_PLUGINS=", 1)[1].split("\nLABEL ", 1)[0]
+        names = ["GF_PATHS_PLUGINS"] + re.findall(r"(?m)^    (GF_[A-Z_]+)=", ours)
+        self.assertGreaterEqual(len(names), 16, names)
+        readme, smoke = read("README.md"), read("scripts/smoke-grafana.sh")
+        for name in names:
+            with self.subTest(name=name):
+                self.assertRegex(readme, rf"`{name}[=`]")
+                if name not in ("GF_PATHS_PLUGINS", "GF_PLUGINS_ALLOW_LOADING_UNSIGNED_PLUGINS"):
+                    section = next(s for s in ("cloud_migration", "grafana_com", "grafana_net", "analytics", "news",
+                                               "plugins", "security", "snapshots") if name.startswith(f"GF_{s.upper()}_"))
+                    key = name[len(section) + 4:].lower()
+                    self.assertRegex(smoke, rf"(?m)^\.{section}\.{key} \S+$")
+
+    def test_nothing_outside_the_data_log_and_temp_paths_is_writable_by_the_grafana_user(self):
+        text = read("Dockerfile.grafana")
+        rootfs = text.split("FROM upstream AS rootfs", 1)[1].split("\nFROM ", 1)[0]
+        self.assertIn("chmod 0755 /run.sh", rootfs)
+        guard = ("find / -xdev \\( -path /proc -o -path /sys -o -path /dev -o -path /tmp -o -path /var/tmp "
+                 "-o -path /var/lib/grafana -o -path /var/log/grafana \\) -prune "
+                 "-o ! -type l \\( -user 472 -o -group 0 -perm -0020 -o -perm -0002 \\) -print")
+        self.assertIn(f'test -z "$({guard})"', rootfs)
+        smoke = read("scripts/smoke-grafana.sh")
+        self.assertIn("check writable ", smoke)
+        self.assertIn("check entrypoint ", smoke)
+        self.assertIn("readOnlyRootFilesystem", read("README.md"))
+
     def test_the_readme_says_when_to_drop_the_rebuild(self):
         readme = " ".join(read("README.md").split())
         self.assertIn(f"`{self.module}` {self.version}", readme)

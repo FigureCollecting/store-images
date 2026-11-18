@@ -20,6 +20,7 @@ VARIABLE = re.compile(r"\$(?:\{(\w+)\}|(\w+))")
 REMOTE = re.compile(r"^(?:https?://|git://|git@)")
 HEREDOC = re.compile(r"(?<!<)<<(?!<)-?\s*[\"']?(\w+)")
 DIRECTIVE = re.compile(r"^#\s*([a-zA-Z][a-zA-Z0-9]*)\s*=\s*(.+?)\s*$")
+BOM = chr(0xFEFF)
 NAMES = ("Dockerfile*", "dockerfile*", "*.Dockerfile", "*.dockerfile", "Containerfile*")
 
 
@@ -51,8 +52,9 @@ def syntax_directive(text):
 
     BuildKit pulls that image to parse the file. Directives are the `# key=value` lines at the very top;
     the first line of any other shape ends them, so a later `# syntax=` is an ordinary comment.
+    BuildKit ignores a byte-order mark in front of the first line, so it is ignored here too.
     """
-    for number, raw in enumerate(text.splitlines(), 1):
+    for number, raw in enumerate(text.removeprefix(BOM).splitlines(), 1):
         directive = DIRECTIVE.match(raw)
         if not directive:
             return None

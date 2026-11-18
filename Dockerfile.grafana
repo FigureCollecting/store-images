@@ -9,7 +9,10 @@
 #   - Grafana's own server binary rebuilt from the public release tag with one module moved to its fixed
 #     version (patches/grafana-server.patch); the frontend and everything else are upstream's files;
 #   - Alpine's zlib moved to the fixed package (pinned file, sha256-verified);
-#   - telemetry, update checks, the news feed, the plugin catalog and run-time plugin installs off by default.
+#   - telemetry, update checks, the news feed, the plugin catalog, run-time plugin installs and Grafana
+#     Cloud Migration off by default;
+#   - the entrypoint and everything else outside the data, log and temp paths root-owned and read-only
+#     for the Grafana user.
 # Build arguments come from images/grafana.env via scripts/build.sh; target = grafana.
 # Every RUN has no network, except the six that fetch a pinned source tree or its go.sum-verified modules.
 ARG GRAFANA_IMAGE=docker.io/grafana/grafana:13.3.1@sha256:0615ec4fbd4072004b7d86b46ded63013a74b7d6eb1119273dd89e8fa25c13cf
@@ -113,6 +116,9 @@ COPY --from=server /out/grafana /tmp/grafana-server
 # trees become root-owned and read-only for the Grafana user (upstream ships the bundled one world-writable).
 # The VictoriaLogs zip also carries backends for other platforms, which are removed.
 # apk writes the time of day into /var/log/apk.log; it is told not to, so that the image is reproducible.
+# Upstream ships the entrypoint writable by group 0, the group of the Grafana user, who could then change
+# what the next start loads. It and the other paths upstream leaves writable outside the data, log and
+# temp directories become root-owned and read-only, and the build fails if any such path is left.
 RUN --network=none set -eu; \
     apklog="$(sha256sum /var/log/apk.log)"; \
     test "$(grafana --version)" = "grafana version ${UPSTREAM_TAG#v}"; \
@@ -141,6 +147,10 @@ RUN --network=none set -eu; \
     install -m 0755 /tmp/vlogs-backend victoriametrics_logs_backend_plugin_linux_amd64; \
     chown -R root:root /usr/share/grafana/plugins; chmod -R u=rwX,go=rX /usr/share/grafana/plugins; \
     test -z "$(find /usr/share/grafana/plugins /usr/share/grafana/data/plugins-bundled ! -type l \( ! -user root -o -perm -0020 -o -perm -0002 \))"; \
+    chmod 0755 /run.sh /etc/network/if-up.d/dad; \
+    chown -R root:root /etc/grafana/provisioning /home/grafana /usr/share/grafana/.aws; \
+    chmod -R u=rwX,go=rX /etc/grafana/provisioning /home/grafana /usr/share/grafana/.aws; \
+    test -z "$(find / -xdev \( -path /proc -o -path /sys -o -path /dev -o -path /tmp -o -path /var/tmp -o -path /var/lib/grafana -o -path /var/log/grafana \) -prune -o ! -type l \( -user 472 -o -group 0 -perm -0020 -o -perm -0002 \) -print)"; \
     rm /tmp/vlogs.zip /tmp/zlib.apk /tmp/jaeger-backend /tmp/vlogs-backend /tmp/grafana-server
 
 # One layer holds the whole final file system, so the removed files are not in the image at all.
@@ -160,9 +170,12 @@ ENV PATH=/usr/share/grafana/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bi
     GF_PATHS_PROVISIONING=/etc/grafana/provisioning
 # Ours. Plugins load from the read-only directory baked in above, not from the data volume; nothing is
 # installed or updated at run time. The periodic calls to grafana.com, stats.grafana.org and gravatar.com
-# are switched off, and every grafana.com address the server reads points at a closed loopback port, so
-# the grafana.com proxy that any signed-in user can call (/api/gnet/*) cannot reach it either.
+# are switched off. The three grafana.com addresses in [grafana_com] and [grafana_net] point at a closed
+# loopback port, so the grafana.com proxy that any signed-in user can call (/api/gnet/*) cannot reach it.
+# Grafana Cloud Migration is off: it dials cms-<cluster>.grafana.net, or any host, from a pasted token.
+# README.md lists every setting that can make the server call out, and its value here.
 ENV GF_PATHS_PLUGINS=/usr/share/grafana/plugins \
+    GF_CLOUD_MIGRATION_ENABLED=false \
     GF_GRAFANA_COM_URL=http://127.0.0.1:9 \
     GF_GRAFANA_COM_API_URL=http://127.0.0.1:9/api \
     GF_GRAFANA_NET_URL=http://127.0.0.1:9 \

@@ -22,8 +22,8 @@ It also holds the recipe for our Grafana image, `ghcr.io/figurecollecting/grafan
 
 ## Grafana
 
-`Dockerfile.grafana` starts from upstream's Grafana OSS image, pinned by digest, and changes six things
-(the sixth, the server rebuild, is described under the table):
+`Dockerfile.grafana` starts from upstream's Grafana OSS image, pinned by digest, and changes seven things
+(the seventh, the server rebuild, is described under the table):
 
 - `victoriametrics-logs-datasource` is baked in from its release zip (pinned version, sha256-verified)
   into `/usr/share/grafana/plugins`.
@@ -40,12 +40,16 @@ It also holds the recipe for our Grafana image, `ghcr.io/figurecollecting/grafan
 - Alpine's `zlib` is moved to the fixed package (a pinned, sha256-verified file).
 - Defaults, set as environment variables so that a mounted `grafana.ini` does not undo them: no usage
   reporting, no update checks for Grafana or plugins, no news feed, no plugin catalog, no preinstalled
-  or run-time plugin installs, no gravatar, no external snapshots. Every grafana.com address the server
-  reads (`[grafana_com] url` and `api_url`, `[grafana_net] url`) points at a closed loopback port, so
-  the grafana.com proxy that any signed-in user can call (`/api/gnet/*`) cannot reach it. With these
-  defaults the server made no DNS query and no outbound connection in a 4-minute probe that also
-  called the avatar, grafana.com proxy, plugin install and external snapshot endpoints. A deployment
-  that overrides these variables can turn the calls back on.
+  or run-time plugin installs, no gravatar, no external snapshots, no Grafana Cloud Migration, and the
+  three grafana.com addresses at a closed loopback port. [Outbound settings](#outbound-settings) lists
+  each one. A deployment that overrides these variables can turn the calls back on.
+- The entrypoint `/run.sh`, which upstream ships writable by group 0 (the Grafana user's group), is
+  mode 0755, and `/etc/grafana/provisioning`, `/home/grafana` and `/usr/share/grafana/.aws` are
+  root-owned. Outside `/var/lib/grafana`, `/var/log/grafana`, `/tmp` and `/var/tmp`, the Grafana user
+  owns nothing and can write nothing; the build and the smoke test both fail otherwise. Without this,
+  code running as the Grafana user could rewrite the entrypoint and load a plugin of its own at the
+  next start. The deployment must still set `readOnlyRootFilesystem: true`, with volumes for those
+  four paths, as a second barrier (the image starts and both plugins work that way).
 
 | Component | Upstream | Ours |
 |---|---|---|
@@ -73,11 +77,63 @@ Grafana's out-of-band security releases (`v13.3.1+security-01`) as newer than th
 
 Go back to a plugin's own signed backend when its upstream releases one with the fixes.
 
-Two clean builds of one commit give the same image ID: the build stamps are fixed, layer timestamps
-are the commit time, and `apk` is told not to write its time-stamped log line.
+Two clean builds of one commit give the same image ID: the build stamps are fixed, file times later
+than the commit time are set to it (earlier ones are kept), and `apk` is told not to write its
+time-stamped log line.
+
+### Outbound settings
+
+Every setting in Grafana 13.3's `conf/defaults.ini` that can make the server call out by itself or on
+a user's request, and its value in this image. "Ours" rows are set in `Dockerfile.grafana` and read
+back by the smoke test.
+
+| Setting | Upstream default | Reaches | This image |
+|---|---|---|---|
+| `[cloud_migration] enabled` | `true` | `cms-<cluster>.grafana.net`, or any host named in a token a server admin pastes | ours: `GF_CLOUD_MIGRATION_ENABLED=false`; the endpoints return 404 |
+| `[grafana_com] url` | `https://grafana.com` | grafana.com sign-in and sign-out | ours: `GF_GRAFANA_COM_URL=http://127.0.0.1:9` |
+| `[grafana_com] api_url` | `https://grafana.com/api` | the `/api/gnet/*` proxy (any signed-in user), plugin catalog, installs and update checks, signing-key download, Cloud Migration's token calls | ours: `GF_GRAFANA_COM_API_URL=http://127.0.0.1:9/api` |
+| `[grafana_net] url` | `https://grafana.com` | older name of `[grafana_com] url` | ours: `GF_GRAFANA_NET_URL=http://127.0.0.1:9` |
+| `[analytics] reporting_enabled` | `true` | `stats.grafana.org` (address fixed in the code) | ours: `GF_ANALYTICS_REPORTING_ENABLED=false` |
+| `[analytics] check_for_updates` | `true` | `grafana.com/api/grafana/versions` (address fixed in the code) | ours: `GF_ANALYTICS_CHECK_FOR_UPDATES=false` |
+| `[analytics] check_for_plugin_updates` | `true` | plugin versions and the Angular pattern list, at `api_url` | ours: `GF_ANALYTICS_CHECK_FOR_PLUGIN_UPDATES=false` |
+| `[analytics] feedback_links_enabled` | `true` | links in the UI only | ours: `GF_ANALYTICS_FEEDBACK_LINKS_ENABLED=false` |
+| `[news] news_feed_enabled` | `true` | `grafana.com/blog/news.xml`, fetched by the browser | ours: `GF_NEWS_NEWS_FEED_ENABLED=false` |
+| `[plugins] preinstall_disabled` | `false` | installs Grafana's default plugin list from `api_url` at start | ours: `GF_PLUGINS_PREINSTALL_DISABLED=true` |
+| `[plugins] plugin_admin_enabled` | `true` | catalog browsing and installs from `api_url` | ours: `GF_PLUGINS_PLUGIN_ADMIN_ENABLED=false` |
+| `[plugins] public_key_retrieval_disabled` | `false` | signing-key download from `api_url` | ours: `GF_PLUGINS_PUBLIC_KEY_RETRIEVAL_DISABLED=true` |
+| `[security] disable_gravatar` | `false` | `secure.gravatar.com` (`gravatar_url`), through the server's `/avatar` proxy | ours: `GF_SECURITY_DISABLE_GRAVATAR=true` |
+| `[snapshots] external_enabled` | `true` | `snapshots.raintank.io` (`external_snapshot_url`) | ours: `GF_SNAPSHOTS_EXTERNAL_ENABLED=false` |
+| `[plugins] plugin_catalog_url` | grafana.com | a link in the UI only | upstream's |
+| `[secretscan] enabled` | `false` | `secret-scanning.grafana.net` (`base_url`) | upstream's: off |
+| `[auth.grafana_com]`, `[auth.grafananet] enabled` | `false` | grafana.com sign-in | upstream's: off |
+| `[feature_toggles.openfeature] provider`, `url` | `static`, empty | a feature-flag service | upstream's: none; the image sets no feature toggle |
+| `[server] cdn_url` | empty | a CDN for the frontend files (browser) | upstream's: none |
+| `[analytics]` trackers (Google Analytics, Tag Manager, RudderStack, PostHog, Application Insights) | empty | the vendor, from the browser | upstream's: none |
+| `[log.frontend] enabled` | `false` | frontend logs, to this server unless pointed elsewhere | upstream's: off |
+| `[tracing.*] address`, `[rendering] server_url`, `[external_image_storage] provider`, `[remote.alertmanager] url`, `[smtp] enabled`, `[unified_alerting] ha_peers` | empty or `false` | the host the operator names | upstream's: none |
+
+Two more image defaults, not outbound switches: `GF_PATHS_PLUGINS` is the baked-in read-only directory,
+and `GF_PLUGINS_ALLOW_LOADING_UNSIGNED_PLUGINS` names the two rebuilt plugins.
+
+Data sources, alert contact points, sign-in providers and provisioned Git repositories reach the hosts
+an admin gives them; that is their purpose and no default covers it.
+
+With these defaults the server made no DNS query and no outbound connection in a run that called the
+avatar, grafana.com proxy, plugin install, external snapshot and Cloud Migration endpoints as admin
+and then opened 54 pages of the UI in a browser (checked 2026-11-18).
 
 Known limits:
 
+- The operator's browser still fetches from third parties in two cases, both upstream behaviour. The
+  VictoriaLogs plugin's page (`/plugins/victoriametrics-logs-datasource`) shows its README, whose 20
+  images load from github.com. Upstream's frontend bundles FingerprintJS, which reports to
+  `openfpcdn.io` on about one page load in a thousand. A content security policy that limits
+  `img-src` and `connect-src` to `'self'` should stop both; it is not set here and not tested.
+- `GF_AWS_PROFILES` no longer works: the entrypoint cannot write `/usr/share/grafana/.aws/credentials`
+  and stops. No bundled data source that reads it is left in the image.
+- Provisioning files must be mounted; the Grafana user cannot create them in `/etc/grafana/provisioning`.
+- `scripts/check_pins.py` reads a `DOCKERFILE=` line in `images/*.env` only when it starts the line
+  (not `export DOCKERFILE=` or an indented one), and skips Dockerfiles under dot directories.
 - The `zlib` pin is a file on Alpine's CDN, which keeps only the current package version. When Alpine
   supersedes 1.4-r0 the URL returns 404 and the Grafana build fails until it is re-pinned. Nothing
   watches for that.
