@@ -5,10 +5,12 @@
 #   - the backends of the two data sources rebuilt from their release tags with the dependency fixes
 #     upstream has on main but has not released (patches/grafana-jaeger.patch, patches/grafana-vlogs.patch),
 #     using the flags of upstream's own release binaries; nothing else of the plugins is changed;
+#   - Grafana's own server binary rebuilt from the public release tag with one module moved to its fixed
+#     version (patches/grafana-server.patch); the frontend and everything else are upstream's files;
 #   - Alpine's zlib moved to the fixed package (pinned file, sha256-verified);
 #   - telemetry, update checks, the news feed, the plugin catalog and run-time plugin installs off by default.
 # Build arguments come from images/grafana.env via scripts/build.sh; target = grafana.
-# Every RUN has no network, except the four that fetch a pinned source tree or its go.sum-verified modules.
+# Every RUN has no network, except the six that fetch a pinned source tree or its go.sum-verified modules.
 ARG GRAFANA_IMAGE=docker.io/grafana/grafana:13.3.1@sha256:0615ec4fbd4072004b7d86b46ded63013a74b7d6eb1119273dd89e8fa25c13cf
 ARG GO_IMAGE=docker.io/library/golang:1.27.3@sha256:2669ec97bbb6e54602952b4171211116e3fe90e5f9c47619920c74554b3d7d09
 ARG VLOGS_DS_ZIP=https://github.com/VictoriaMetrics/victorialogs-datasource/releases/download/v0.34.0/victoriametrics-logs-datasource-v0.34.0.zip
@@ -22,6 +24,33 @@ ARG GO_VERSION
 ENV GOTOOLCHAIN=local GOFLAGS=-mod=readonly CGO_ENABLED=0 GOOS=linux GOARCH=amd64 GOAMD64=v1
 RUN --network=none test "$(go env GOVERSION)" = "go${GO_VERSION}"
 WORKDIR /src
+
+FROM ${GRAFANA_IMAGE} AS upstream
+
+# Grafana's server: the public release tag with ONE module moved (patches/grafana-server.patch), built with
+# upstream's settings (go1.27.3, CGO off, -trimpath, no tags: `go version -m` on upstream's binary).
+# The build fails unless the result has the patched version and is otherwise built from exactly the
+# modules, at exactly the versions and hashes, of upstream's own binary.
+# `grafana server -v` reports the tag's commit and a branch that names the patch.
+FROM go AS server
+ARG UPSTREAM_REPO UPSTREAM_TAG UPSTREAM_COMMIT UPSTREAM_BUILD_STAMP UPSTREAM_PATCH_MODULE UPSTREAM_PATCH_VERSION
+RUN git -c advice.detachedHead=false clone --quiet --depth 1 --branch "${UPSTREAM_TAG}" "${UPSTREAM_REPO}" . \
+ && test "$(git rev-parse HEAD)" = "${UPSTREAM_COMMIT}"
+COPY patches/grafana-server.patch /tmp/deps.patch
+RUN --network=none git apply --check /tmp/deps.patch && git apply /tmp/deps.patch \
+ && test "$(git diff --numstat | tr '\t\n' '  ')" = "1 1 go.mod 2 2 go.sum " \
+ && grep -qxP "\t${UPSTREAM_PATCH_MODULE} ${UPSTREAM_PATCH_VERSION} // indirect" go.mod
+RUN go list -deps ./pkg/cmd/grafana >/dev/null
+COPY --from=upstream /usr/share/grafana/bin/grafana /tmp/upstream
+RUN --network=none GOPROXY=off go build -buildvcs=false -trimpath \
+      -ldflags "-X main.version=${UPSTREAM_TAG#v} -X main.commit=${UPSTREAM_COMMIT} -X main.buildBranch=${UPSTREAM_TAG}-fc-${UPSTREAM_PATCH_MODULE##*/}-${UPSTREAM_PATCH_VERSION} -X main.buildstamp=${UPSTREAM_BUILD_STAMP}" \
+      -o /out/grafana ./pkg/cmd/grafana \
+ && go version -m /out/grafana >/tmp/buildinfo && go version -m /tmp/upstream >/tmp/upstream-buildinfo \
+ && grep -qP "^\tdep\t${UPSTREAM_PATCH_MODULE}\t${UPSTREAM_PATCH_VERSION}\t" /tmp/buildinfo \
+ && grep -cP "^\tdep\t${UPSTREAM_PATCH_MODULE}\t" /tmp/upstream-buildinfo | grep -qx 1 \
+ && diff <(tail -n +2 /tmp/upstream-buildinfo | grep -vP "^\tdep\t${UPSTREAM_PATCH_MODULE}\t") \
+         <(tail -n +2 /tmp/buildinfo | grep -vP "^\tdep\t${UPSTREAM_PATCH_MODULE}\t") \
+ && test "$(git status --porcelain --untracked-files=no | tr '\n' ' ')" = " M go.mod  M go.sum "
 
 # Jaeger data source backend: its release tag with golang.org/x/net moved to the fixed version.
 FROM go AS jaeger
@@ -63,18 +92,23 @@ RUN --network=none GOPROXY=off go build -tags arrow_json_stdlib \
  && grep -qP "^\tbuild\tvcs.revision=${VLOGS_DS_COMMIT}$" /tmp/buildinfo \
  && test "$(git status --porcelain --untracked-files=no | tr '\n' ' ')" = " M go.mod  M go.sum "
 
-FROM ${GRAFANA_IMAGE} AS rootfs
-ARG UPSTREAM_TAG VLOGS_DS_TAG JAEGER_DS_TAG VLOGS_DS_ZIP VLOGS_DS_SHA256 ZLIB_APK ZLIB_SHA256
+FROM upstream AS rootfs
+ARG UPSTREAM_TAG UPSTREAM_COMMIT UPSTREAM_PATCH_MODULE UPSTREAM_PATCH_VERSION \
+    VLOGS_DS_TAG JAEGER_DS_TAG VLOGS_DS_ZIP VLOGS_DS_SHA256 ZLIB_APK ZLIB_SHA256
 USER root
 ADD --checksum=${VLOGS_DS_SHA256} ${VLOGS_DS_ZIP} /tmp/vlogs.zip
 ADD --checksum=${ZLIB_SHA256} ${ZLIB_APK} /tmp/zlib.apk
 COPY --from=jaeger /out/backend /tmp/jaeger-backend
 COPY --from=vlogs /out/backend /tmp/vlogs-backend
+COPY --from=server /out/grafana /tmp/grafana-server
 # A rebuilt backend no longer matches its plugin's signed MANIFEST.txt, so the manifest goes and the two
 # plugins are allowed to load unsigned below. The VictoriaLogs zip also carries backends for other
 # platforms, which are removed.
 RUN --network=none set -eu; \
     test "$(grafana --version)" = "grafana version ${UPSTREAM_TAG#v}"; \
+    cat /tmp/grafana-server >/usr/share/grafana/bin/grafana; \
+    test "$(grafana --version)" = "grafana version ${UPSTREAM_TAG#v}"; \
+    test "$(grafana server -v)" = "Version ${UPSTREAM_TAG#v} (commit: ${UPSTREAM_COMMIT}, branch: ${UPSTREAM_TAG}-fc-${UPSTREAM_PATCH_MODULE##*/}-${UPSTREAM_PATCH_VERSION})"; \
     apk add --no-network /tmp/zlib.apk; \
     apk info -v | grep -qx "$(basename "${ZLIB_APK}" .apk)"; \
     cd /usr/share/grafana/data/plugins-bundled; \
@@ -94,11 +128,12 @@ RUN --network=none set -eu; \
     rm victoriametrics_logs_backend_plugin_* MANIFEST.txt; \
     install -m 0755 /tmp/vlogs-backend victoriametrics_logs_backend_plugin_linux_amd64; \
     chown -R root:root .; chmod -R u=rwX,go=rX .; \
-    rm /tmp/vlogs.zip /tmp/zlib.apk /tmp/jaeger-backend /tmp/vlogs-backend
+    rm /tmp/vlogs.zip /tmp/zlib.apk /tmp/jaeger-backend /tmp/vlogs-backend /tmp/grafana-server
 
 # One layer holding the final file system: the removed files are not in the image at all.
 FROM scratch AS grafana
-ARG GRAFANA_IMAGE UPSTREAM_REPO UPSTREAM_TAG VLOGS_DS_REPO VLOGS_DS_TAG VLOGS_DS_COMMIT VLOGS_DS_FIX_COMMIT \
+ARG GRAFANA_IMAGE UPSTREAM_REPO UPSTREAM_TAG UPSTREAM_COMMIT UPSTREAM_FIX_COMMIT \
+    UPSTREAM_PATCH_MODULE UPSTREAM_PATCH_VERSION VLOGS_DS_REPO VLOGS_DS_TAG VLOGS_DS_COMMIT VLOGS_DS_FIX_COMMIT \
     JAEGER_DS_REPO JAEGER_DS_TAG JAEGER_DS_COMMIT JAEGER_DS_FIX_COMMIT XNET_VERSION COMPRESS_VERSION \
     GO_VERSION FC_REVISION FC_COMMIT CREATED DOCS_URL
 COPY --from=rootfs / /
@@ -128,13 +163,16 @@ LABEL org.opencontainers.image.source="https://github.com/FigureCollecting/store
       org.opencontainers.image.version="${UPSTREAM_TAG}-${FC_REVISION}" \
       org.opencontainers.image.created="${CREATED}" \
       org.opencontainers.image.title="grafana" \
-      org.opencontainers.image.description="Grafana OSS ${UPSTREAM_TAG} with victoriametrics-logs-datasource ${VLOGS_DS_TAG} and Jaeger ${JAEGER_DS_TAG}, their backends rebuilt with Go ${GO_VERSION} and fixed dependencies; unused data sources removed" \
+      org.opencontainers.image.description="Grafana OSS ${UPSTREAM_TAG}, server rebuilt with ${UPSTREAM_PATCH_MODULE} ${UPSTREAM_PATCH_VERSION}, with victoriametrics-logs-datasource ${VLOGS_DS_TAG} and Jaeger ${JAEGER_DS_TAG}, their backends rebuilt with Go ${GO_VERSION} and fixed dependencies; unused data sources removed" \
       org.opencontainers.image.documentation="${DOCS_URL}" \
       org.opencontainers.image.licenses="AGPL-3.0-only" \
       org.opencontainers.image.vendor="FigureCollecting" \
       org.opencontainers.image.base.name="${GRAFANA_IMAGE}" \
       com.figurecollecting.upstream.source="${UPSTREAM_REPO}" \
       com.figurecollecting.upstream.tag="${UPSTREAM_TAG}" \
+      com.figurecollecting.upstream.commit="${UPSTREAM_COMMIT}" \
+      com.figurecollecting.upstream.patch="${UPSTREAM_PATCH_MODULE} ${UPSTREAM_PATCH_VERSION}" \
+      com.figurecollecting.upstream.fix-commit="${UPSTREAM_FIX_COMMIT}" \
       com.figurecollecting.go.version="${GO_VERSION}" \
       com.figurecollecting.x-net.version="${XNET_VERSION}" \
       com.figurecollecting.compress.version="${COMPRESS_VERSION}" \

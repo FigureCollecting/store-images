@@ -22,7 +22,8 @@ It also holds the recipe for our Grafana image, `ghcr.io/figurecollecting/grafan
 
 ## Grafana
 
-`Dockerfile.grafana` starts from upstream's Grafana OSS image, pinned by digest, and changes five things:
+`Dockerfile.grafana` starts from upstream's Grafana OSS image, pinned by digest, and changes six things
+(the sixth, the server rebuild, is described under the table):
 
 - `victoriametrics-logs-datasource` is baked in from its release zip (pinned version, sha256-verified)
   into `/usr/share/grafana/plugins`, which the Grafana user cannot write.
@@ -40,14 +41,23 @@ It also holds the recipe for our Grafana image, `ghcr.io/figurecollecting/grafan
 
 | Component | Upstream | Ours |
 |---|---|---|
-| Grafana OSS | v13.3.1 | unchanged binary, non-root as upstream (uid 472) |
+| Grafana server | v13.3.1 (5db6ba8876): thrift v0.24.0 | thrift v0.25.0 (upstream f9eeaa2a on release-13.3.2); frontend and the rest unchanged, non-root as upstream (uid 472) |
 | victoriametrics-logs-datasource | v0.34.0 (a5450dee43): Go 1.27.2, x/net v0.60.0, compress v1.19.2 | Go 1.27.3, x/net v0.62.0, compress v1.20.4 (upstream 2d682142, 12c4778f on main) |
 | Jaeger data source | v13.0.8 (7bf6c164d5): x/net v0.61.0 | x/net v0.62.0 (upstream cb0d47d1 on main) |
 | zlib (Alpine 3.24) | 1.3.2-r1 | 1.4-r0 |
 
-Known gap: Grafana v13.3.1's own binary carries `github.com/apache/thrift` v0.24.0, which grype
-reports (fixed in v0.25.0; upstream's `release-13.3.2` branch has it). The scan gate fails on it until
-the recipe moves to a Grafana release with the fix.
+Grafana's own server binary is rebuilt too. Upstream's v13.3.1 binary carries
+`github.com/apache/thrift` v0.24.0, which the scan gate reports. The server is built from the public
+v13.3.1 tag with one change, `github.com/apache/thrift` v0.25.0 (`patches/grafana-server.patch`), with
+upstream's build settings, and replaces the binary in upstream's image. The build fails unless the
+result is built from the same modules, at the same versions, as upstream's binary apart from that one.
+`grafana server -v` reports `Version 13.3.1 (commit: <the tag's commit>, branch: v13.3.1-fc-thrift-v0.25.0)`.
+Upstream's published binary reports a commit that is not in the public repository
+(`branch: release-13.3.1#patched`); ours is built from what the public tag holds.
+
+Drop the server rebuild when the recipe moves to a Grafana release, 13.3.2 or later, that ships thrift
+v0.25.0 or later: delete the `server` stage and `patches/grafana-server.patch`. The weekly
+`upstream-watch` reads the new release's `go.mod` and says whether to drop or keep it.
 
 Go back to a plugin's own signed backend when its upstream releases one with the fixes.
 

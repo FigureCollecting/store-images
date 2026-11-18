@@ -122,10 +122,12 @@ check backends "plugin executables in the image: ${backends:-none}" test "$backe
 # The two backends are the rebuilt ones: the fixed Go and dependencies, upstream's commit and build settings.
 docker cp -q "$name:$jaeger_bin" "$work/jaeger" 2>/dev/null
 docker cp -q "$name:$vlogs_bin" "$work/vlogs" 2>/dev/null
+docker cp -q "$name:/usr/share/grafana/bin/grafana" "$work/server" 2>/dev/null
 chmod -R a+rX "$work"
-docker run --rm --network none -v "$work:/b:ro" "$GO_IMAGE" go version -m /b/jaeger /b/vlogs >"$work/buildinfo" 2>&1
+docker run --rm --network none -v "$work:/b:ro" "$GO_IMAGE" go version -m /b/jaeger /b/vlogs /b/server >"$work/buildinfo" 2>&1
 buildinfo() {  # buildinfo <binary> <pattern>: the pattern matches a line of that binary's section
-  awk -v bin="/b/$1:" '$1 == bin { on = 1; print; next } /^\/b\// { on = 0 } on' "$work/buildinfo" | grep -qE "$2"
+  awk -v bin="/b/$1:" '$1 == bin { on = 1; print; next } /^\/b\// { on = 0 } on' "$work/buildinfo" >"$work/section"
+  grep -qE "$2" "$work/section"  # from a file: grep -q on a pipe can end awk with SIGPIPE and fail the check
 }
 while read -r bin want; do
   check buildinfo "$bin $want" buildinfo "$bin" "$want"
@@ -141,7 +143,19 @@ vlogs dep[[:space:]]+github.com/klauspost/compress[[:space:]]+${COMPRESS_VERSION
 vlogs build[[:space:]]+vcs.revision=$VLOGS_DS_COMMIT\$
 vlogs build[[:space:]]+CGO_ENABLED=0\$
 vlogs pluginID.{1,4}victoriametrics-logs-datasource.{1,20}version.{1,4}${VLOGS_DS_TAG#v}[^0-9]
+server ^/b/server: go$GO_VERSION\$
+server path[[:space:]]+github.com/grafana/grafana/pkg/cmd/grafana\$
+server dep[[:space:]]+${UPSTREAM_PATCH_MODULE}[[:space:]]+${UPSTREAM_PATCH_VERSION}[[:space:]]
+server build[[:space:]]+CGO_ENABLED=0\$
+server build[[:space:]]+-trimpath=true\$
 EOF
+
+# The server is the rebuilt one and says so: upstream's version, the public tag's commit, our patch in the branch.
+branch="${UPSTREAM_TAG}-fc-${UPSTREAM_PATCH_MODULE##*/}-${UPSTREAM_PATCH_VERSION}"
+said=$(docker run --rm --network none --entrypoint grafana "$img" server -v 2>&1 | head -1)
+check server-version "grafana server -v -> '${said}'" \
+  test "$said" = "Version ${UPSTREAM_TAG#v} (commit: ${UPSTREAM_COMMIT}, branch: ${branch})"
+check server-commit "/api/health commit is ${UPSTREAM_COMMIT}" is "$health" .commit "$UPSTREAM_COMMIT"
 
 [ "$failures" = 0 ] || { echo "--- container log (warnings and errors, tail)"; docker logs "$name" 2>&1 | grep -E 'level=(warn|error)' | tail -15 | cut -c1-300; }
 echo "SMOKE $([ "$failures" = 0 ] && echo PASS || echo "FAIL ($failures)") $app $img"

@@ -14,6 +14,12 @@ VT = "# comment\nAPP_NAME=victoria-traces\nUPSTREAM_REPO=https://github.com/Vict
 GF = ("APP_NAME=grafana\nUPSTREAM_REPO=https://github.com/grafana/grafana\nUPSTREAM_TAG=v13.3.1\nWATCH_ACTION=rebuild\n"
       "VLOGS_DS_REPO=https://github.com/VictoriaMetrics/victorialogs-datasource\nVLOGS_DS_TAG=v0.34.0\n"
       "JAEGER_DS_REPO=https://github.com/grafana/grafana-jaeger-datasource\nJAEGER_DS_TAG=v13.0.8\n")
+PATCHED = "UPSTREAM_PATCH_MODULE=github.com/apache/thrift\nUPSTREAM_PATCH_VERSION=v0.25.0\n"
+GOMOD = ("module github.com/grafana/grafana\n\ngo 1.27.4\n\nrequire (\n"
+         "\tgithub.com/apache/thrift-extra v9.9.9\n"
+         "\tgithub.com/apache/thrift v0.24.0 // indirect\n"
+         "\tgithub.com/apparentlymart/go-textseg/v15 v15.0.0 // indirect\n)\n"
+         "replace example.org/x => github.com/apache/thrift v0.1.0\n")
 
 
 def rel(tag, draft=False, prerelease=False):
@@ -31,17 +37,91 @@ class WatchTest(unittest.TestCase):
             with open(os.path.join(self.tmp.name, name.replace("_", "-") + ".env"), "w", encoding="utf-8") as fh:
                 fh.write(body)
 
-    def run_watch(self, releases):
+    def run_watch(self, releases, gomods=None):
         def fetch(owner_repo):
             self.calls.append(owner_repo)
             value = releases[owner_repo]
             if isinstance(value, Exception):
                 raise value
             return value
+
+        def read_gomod(owner_repo, tag):
+            self.gomod_calls.append((owner_repo, tag))
+            value = (gomods or {})[tag]
+            if isinstance(value, Exception):
+                raise value
+            return value
+        self.gomod_calls = []
         out = io.StringIO()
         with redirect_stdout(out):
-            rc = upstream_watch.main(["--images-dir", self.tmp.name], fetch=fetch)
+            rc = upstream_watch.main(["--images-dir", self.tmp.name], fetch=fetch, read_gomod=read_gomod)
         return rc, out.getvalue()
+
+    def grafana_release(self, tag, gomod):
+        self.images(grafana=GF + PATCHED)
+        return self.run_watch({"grafana/grafana": [rel(tag), rel("v13.3.1")],
+                               "VictoriaMetrics/victorialogs-datasource": [rel("v0.34.0")],
+                               "grafana/grafana-jaeger-datasource": [rel("v13.0.8")]}, {tag: gomod})
+
+    def test_a_release_that_ships_the_patched_module_says_drop_the_server_rebuild(self):
+        for theirs in ("v0.25.0", "v0.26.1", "v1.0.0"):
+            with self.subTest(theirs=theirs):
+                rc, out = self.grafana_release("v13.3.2", GOMOD.replace("v0.24.0", theirs))
+                self.assertEqual(rc, 1)
+                self.assertIn("::error title=Upstream released grafana v13.3.2::grafana: base v13.3.1, upstream "
+                              "released v13.3.2. Re-pin images/grafana.env and its Dockerfile to it, rebuild and bump "
+                              f"FC_REVISION. It ships github.com/apache/thrift {theirs} (ours v0.25.0): DROP the server "
+                              "rebuild and patches/grafana-server.patch.", out)
+                self.assertEqual(self.gomod_calls, [("grafana/grafana", "v13.3.2")])
+
+    def test_a_release_that_still_ships_the_old_module_says_keep_the_server_rebuild(self):
+        rc, out = self.grafana_release("v13.4.0", GOMOD)
+        self.assertEqual(rc, 1)
+        self.assertIn("upstream released v13.4.0. Re-pin images/grafana.env and its Dockerfile to it, rebuild and bump "
+                      "FC_REVISION. It still ships github.com/apache/thrift v0.24.0 (ours v0.25.0): KEEP the server "
+                      "rebuild.", out)
+        self.assertNotIn("DROP", out)
+
+    def test_a_release_without_the_patched_module_says_drop_the_server_rebuild(self):
+        rc, out = self.grafana_release("v13.3.2", "module github.com/grafana/grafana\n\ngo 1.27.4\n")
+        self.assertEqual(rc, 1)
+        self.assertIn("It no longer requires github.com/apache/thrift: DROP the server rebuild and "
+                      "patches/grafana-server.patch.", out)
+
+    def test_an_unreadable_or_odd_go_mod_is_an_error_not_advice(self):
+        for gomod, why in ((OSError("HTTP 404"), "HTTP 404"),
+                           (GOMOD.replace("v0.24.0", "v0.25.1-0.20261101000000-abcdef123456"),
+                            "github.com/apache/thrift v0.25.1-0.20261101000000-abcdef123456 is not vX.Y.Z")):
+            with self.subTest(why=why):
+                rc, out = self.grafana_release("v13.3.2", gomod)
+                self.assertEqual(rc, 2)
+                self.assertIn("::error title=Upstream watch failed::grafana: upstream released v13.3.2, but its go.mod "
+                              f"cannot be checked for the server rebuild: {why}", out)
+                self.assertNotIn("DROP", out)
+                self.assertNotIn("KEEP", out)
+
+    def test_a_bad_patch_version_in_the_definition_is_an_error(self):
+        self.images(grafana=GF + PATCHED.replace("UPSTREAM_PATCH_VERSION=v0.25.0", "UPSTREAM_PATCH_VERSION=0.25"))
+        rc, out = self.run_watch({"grafana/grafana": [rel("v13.3.2")],
+                                  "VictoriaMetrics/victorialogs-datasource": [rel("v0.34.0")],
+                                  "grafana/grafana-jaeger-datasource": [rel("v13.0.8")]}, {"v13.3.2": GOMOD})
+        self.assertEqual(rc, 2)
+        self.assertIn("cannot be checked for the server rebuild: UPSTREAM_PATCH_VERSION '0.25' is not vX.Y.Z", out)
+        self.assertEqual(self.gomod_calls, [])
+
+    def test_no_newer_release_reads_no_go_mod(self):
+        self.images(grafana=GF + PATCHED)
+        rc, out = self.run_watch({"grafana/grafana": [rel("v13.3.1")],
+                                  "VictoriaMetrics/victorialogs-datasource": [rel("v0.35.0")],
+                                  "grafana/grafana-jaeger-datasource": [rel("v13.0.8")]})
+        self.assertEqual(rc, 1)
+        self.assertEqual(self.gomod_calls, [])
+        self.assertNotIn("server rebuild", out)
+
+    def test_the_grafana_definition_in_this_repository_names_the_patched_module(self):
+        env = upstream_watch.read_env(os.path.join(os.path.dirname(__file__), "..", "images", "grafana.env"))
+        self.assertEqual(env.get("UPSTREAM_PATCH_MODULE"), "github.com/apache/thrift")
+        self.assertGreaterEqual(upstream_watch.version(env.get("UPSTREAM_PATCH_VERSION")), (0, 25, 0))
 
     def test_no_newer_release_passes(self):
         self.images(victoria_logs=VL, victoria_traces=VT)
@@ -199,6 +279,28 @@ class FetchTest(unittest.TestCase):
         self.assertEqual(got, [{"tag_name": "v1.53.0"}])
         self.assertEqual(seen["url"], "https://api.github.com/repos/VictoriaMetrics/VictoriaLogs/releases?per_page=50")
         self.assertEqual(seen["auth"], "Bearer t0ken")
+        self.assertEqual(seen["timeout"], 30)
+
+    def test_go_mod_fetch_reads_the_file_at_the_tag(self):
+        seen = {}
+
+        class Resp(io.BytesIO):
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        def opener(req, timeout):
+            seen["url"], seen["auth"], seen["timeout"] = req.full_url, req.get_header("Authorization"), timeout
+            return Resp(b"module github.com/grafana/grafana\n")
+
+        os.environ["GITHUB_TOKEN"] = "t0ken"  # noqa: S105 (a fake token: it must NOT be sent to the raw host)
+        self.addCleanup(os.environ.pop, "GITHUB_TOKEN", None)
+        got = upstream_watch.gomod_at("grafana/grafana", "v13.3.2", opener=opener)
+        self.assertEqual(got, "module github.com/grafana/grafana\n")
+        self.assertEqual(seen["url"], "https://raw.githubusercontent.com/grafana/grafana/v13.3.2/go.mod")
+        self.assertIsNone(seen["auth"])
         self.assertEqual(seen["timeout"], 30)
 
     def test_github_fetch_without_token_sends_no_auth(self):
