@@ -10,7 +10,7 @@ This repository will be archived once upstream publishes releases built with the
 and it holds no other image we use. At that point, consumers pin upstream's own images again.
 
 It also holds the recipe for our Grafana image, `ghcr.io/figurecollecting/grafana` (see
-[Grafana](#grafana)). The recipe is public; the image is internal and its package stays private.
+[Grafana](#grafana)). The recipe is public; the image is internal today; see [CI](#ci), last paragraph.
 
 ## What is rebuilt
 
@@ -219,5 +219,5 @@ Known limits:
   image's scan, re-pin the store and bump the tag in `watch/`; the rebuilds in `images/` stay.
   For Grafana it also watches the two data sources, and a newer release means re-pin and rebuild.
 
-Consumers pin by digest. The VictoriaTraces package must be public for anonymous
-pulls; the Grafana package is private and is pulled with a pull secret.
+Consumers pin by digest. Both packages are internal today; the cluster can pull them only
+after they are made public or a pull secret is added, which is decided before either image is deployed.
