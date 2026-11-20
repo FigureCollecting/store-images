@@ -1,3 +1,3 @@
-# The build context needs only the Go-version patches.
+# The build context needs only the patches (go.mod and go.sum changes).
 *
 !patches/
