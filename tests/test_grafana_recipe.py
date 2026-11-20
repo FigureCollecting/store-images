@@ -78,11 +78,25 @@ class ServerRebuildTest(unittest.TestCase):
 
     def test_nothing_time_stamped_is_written_and_the_plugin_trees_are_locked(self):
         text = read("Dockerfile.grafana")
-        self.assertIn("apk add --no-network --no-logfile /tmp/zlib.apk", text)
+        self.assertIn("apk add --no-network --no-logfile /tmp/zlib.apk /tmp/libcrypto3.apk /tmp/libssl3.apk", text)
         self.assertIn('test "$(sha256sum /var/log/apk.log)" = "${apklog}"', text)
         self.assertNotIn("-o grafana", text)
         self.assertIn("/usr/share/grafana/plugins /usr/share/grafana/data/plugins-bundled ! -type l "
                       "\\( ! -user root -o -perm -0020 -o -perm -0002 \\)", text)
+
+    def test_the_alpine_packages_are_pinned_files_at_the_fixed_versions_and_the_readme_lists_them(self):
+        text, readme = read("Dockerfile.grafana"), read("README.md")
+        fixed = {"zlib": "1.4-r0", "libcrypto3": "3.5.9-r1", "libssl3": "3.5.9-r1"}
+        for name, version in fixed.items():
+            with self.subTest(package=name):
+                var = name.upper()
+                self.assertRegex(text, rf"(?m)^ARG {var}_APK=https://dl-cdn\.alpinelinux\.org/alpine/v3\.24/main/"
+                                       rf"x86_64/{name}-{re.escape(version)}\.apk$")
+                self.assertRegex(text, rf"(?m)^ARG {var}_SHA256=sha256:[0-9a-f]{{64}}$")
+                self.assertIn(f"ADD --checksum=${{{var}_SHA256}} ${{{var}_APK}} /tmp/{name}.apk", text)
+                self.assertIn(f'apk info -v | grep -qx "$(basename "${{{var}_APK}}" .apk)"', text)
+                self.assertIn(f"/tmp/{name}.apk", text.split("    rm /tmp/vlogs.zip", 1)[1].split("\n", 1)[0])
+                self.assertRegex(readme, rf"(?m)^\| {name}[^|]*\| [^|]+ \| {re.escape(version)} \|$")
 
     def test_cloud_migration_is_off_and_the_smoke_test_asks_the_server(self):
         self.assertIn("    GF_CLOUD_MIGRATION_ENABLED=false \\\n", read("Dockerfile.grafana"))

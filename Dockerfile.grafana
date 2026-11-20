@@ -8,7 +8,7 @@
 #     using the flags of upstream's own release binaries; nothing else of the plugins is changed;
 #   - Grafana's own server binary rebuilt from the public release tag with one module moved to its fixed
 #     version (patches/grafana-server.patch); the frontend and everything else are upstream's files;
-#   - Alpine's zlib moved to the fixed package (pinned file, sha256-verified);
+#   - Alpine's zlib, libcrypto3 and libssl3 moved to the fixed packages (pinned files, sha256-verified);
 #   - telemetry, update checks, the news feed, the plugin catalog, run-time plugin installs and Grafana
 #     Cloud Migration off by default;
 #   - the entrypoint and everything else outside the data, log and temp paths root-owned and read-only
@@ -21,6 +21,10 @@ ARG VLOGS_DS_ZIP=https://github.com/VictoriaMetrics/victorialogs-datasource/rele
 ARG VLOGS_DS_SHA256=sha256:6fc61446097a525e826f2ddb6746723f85447845c95a7b1a99624e84d4b2e237
 ARG ZLIB_APK=https://dl-cdn.alpinelinux.org/alpine/v3.24/main/x86_64/zlib-1.4-r0.apk
 ARG ZLIB_SHA256=sha256:7b05bc778b8b25cd880835b40114182bd4d1581717504d0129c810c0a14291cb
+ARG LIBCRYPTO3_APK=https://dl-cdn.alpinelinux.org/alpine/v3.24/main/x86_64/libcrypto3-3.5.9-r1.apk
+ARG LIBCRYPTO3_SHA256=sha256:042026082cc9bc7872d1baa81755c50efa70b05f03b5369fdc5f0a1303009720
+ARG LIBSSL3_APK=https://dl-cdn.alpinelinux.org/alpine/v3.24/main/x86_64/libssl3-3.5.9-r1.apk
+ARG LIBSSL3_SHA256=sha256:18c5778cbe52e1991303f8531970b05d4e6e036ea08349322f7422f42a689dc7
 
 FROM ${GO_IMAGE} AS go
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
@@ -104,10 +108,13 @@ RUN --network=none GOPROXY=off go build -tags arrow_json_stdlib \
 
 FROM upstream AS rootfs
 ARG UPSTREAM_TAG UPSTREAM_COMMIT UPSTREAM_PATCH_MODULE UPSTREAM_PATCH_VERSION \
-    VLOGS_DS_TAG JAEGER_DS_TAG VLOGS_DS_ZIP VLOGS_DS_SHA256 ZLIB_APK ZLIB_SHA256
+    VLOGS_DS_TAG JAEGER_DS_TAG VLOGS_DS_ZIP VLOGS_DS_SHA256 ZLIB_APK ZLIB_SHA256 \
+    LIBCRYPTO3_APK LIBCRYPTO3_SHA256 LIBSSL3_APK LIBSSL3_SHA256
 USER root
 ADD --checksum=${VLOGS_DS_SHA256} ${VLOGS_DS_ZIP} /tmp/vlogs.zip
 ADD --checksum=${ZLIB_SHA256} ${ZLIB_APK} /tmp/zlib.apk
+ADD --checksum=${LIBCRYPTO3_SHA256} ${LIBCRYPTO3_APK} /tmp/libcrypto3.apk
+ADD --checksum=${LIBSSL3_SHA256} ${LIBSSL3_APK} /tmp/libssl3.apk
 COPY --from=jaeger /out/backend /tmp/jaeger-backend
 COPY --from=vlogs /out/backend /tmp/vlogs-backend
 COPY --from=server /out/grafana /tmp/grafana-server
@@ -125,8 +132,10 @@ RUN --network=none set -eu; \
     cat /tmp/grafana-server >/usr/share/grafana/bin/grafana; \
     test "$(grafana --version)" = "grafana version ${UPSTREAM_TAG#v}"; \
     test "$(grafana server -v)" = "Version ${UPSTREAM_TAG#v} (commit: ${UPSTREAM_COMMIT}, branch: ${UPSTREAM_TAG}-fc-${UPSTREAM_PATCH_MODULE##*/}-${UPSTREAM_PATCH_VERSION})"; \
-    apk add --no-network --no-logfile /tmp/zlib.apk; \
+    apk add --no-network --no-logfile /tmp/zlib.apk /tmp/libcrypto3.apk /tmp/libssl3.apk; \
     apk info -v | grep -qx "$(basename "${ZLIB_APK}" .apk)"; \
+    apk info -v | grep -qx "$(basename "${LIBCRYPTO3_APK}" .apk)"; \
+    apk info -v | grep -qx "$(basename "${LIBSSL3_APK}" .apk)"; \
     test "$(sha256sum /var/log/apk.log)" = "${apklog}"; \
     cd /usr/share/grafana/data/plugins-bundled; \
     find . -mindepth 1 -maxdepth 1 ! -name canvas ! -name jaeger -exec rm -r {} +; \
@@ -151,7 +160,7 @@ RUN --network=none set -eu; \
     chown -R root:root /etc/grafana/provisioning /home/grafana /usr/share/grafana/.aws; \
     chmod -R u=rwX,go=rX /etc/grafana/provisioning /home/grafana /usr/share/grafana/.aws; \
     test -z "$(find / -xdev \( -path /proc -o -path /sys -o -path /dev -o -path /tmp -o -path /var/tmp -o -path /var/lib/grafana -o -path /var/log/grafana \) -prune -o ! -type l \( -user 472 -o -group 0 -perm -0020 -o -perm -0002 \) -print)"; \
-    rm /tmp/vlogs.zip /tmp/zlib.apk /tmp/jaeger-backend /tmp/vlogs-backend /tmp/grafana-server
+    rm /tmp/vlogs.zip /tmp/zlib.apk /tmp/libcrypto3.apk /tmp/libssl3.apk /tmp/jaeger-backend /tmp/vlogs-backend /tmp/grafana-server
 
 # One layer holds the whole final file system, so the removed files are not in the image at all.
 # (WORKDIR below adds a second, empty layer.)

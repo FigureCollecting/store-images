@@ -37,7 +37,7 @@ It also holds the recipe for our Grafana image, `ghcr.io/figurecollecting/grafan
   and no others, are allowed to load unsigned. Because nothing then verifies their files at start,
   both plugin trees (`/usr/share/grafana/plugins` and `data/plugins-bundled`, where Jaeger lives) are
   root-owned and the Grafana user cannot write, rename or add anything in them.
-- Alpine's `zlib` is moved to the fixed package (a pinned, sha256-verified file).
+- Alpine's `zlib`, `libcrypto3` and `libssl3` are moved to the fixed packages (pinned, sha256-verified files).
 - Defaults, set as environment variables so that a mounted `grafana.ini` does not undo them: no usage
   reporting, no update checks for Grafana or plugins, no news feed, no plugin catalog, no preinstalled
   or run-time plugin installs, no gravatar, no external snapshots, no Grafana Cloud Migration, and the
@@ -57,6 +57,8 @@ It also holds the recipe for our Grafana image, `ghcr.io/figurecollecting/grafan
 | victoriametrics-logs-datasource | v0.34.0 (a5450dee43): Go 1.27.2, x/net v0.60.0, compress v1.19.2 | Go 1.27.4, x/net v0.62.0, compress v1.20.4 (upstream 2d682142, 12c4778f on main) |
 | Jaeger data source | v13.0.8 (7bf6c164d5): Go 1.27.3, x/net v0.61.0 | Go 1.27.4, x/net v0.62.0 (upstream cb0d47d1 on main) |
 | zlib (Alpine 3.24) | 1.3.2-r1 | 1.4-r0 |
+| libcrypto3 (Alpine 3.24) | 3.5.9-r0 | 3.5.9-r1 |
+| libssl3 (Alpine 3.24) | 3.5.9-r0 | 3.5.9-r1 |
 
 Grafana's own server binary is rebuilt too. Upstream's v13.3.1 binary carries
 `github.com/apache/thrift` v0.24.0, which the scan gate reports. The server is built from the public
@@ -145,8 +147,8 @@ Known limits:
 - Provisioning files must be mounted; the Grafana user cannot create them in `/etc/grafana/provisioning`.
 - `scripts/check_pins.py` reads a `DOCKERFILE=` line in `images/*.env` only when it starts the line
   (not `export DOCKERFILE=` or an indented one), and skips Dockerfiles under dot directories.
-- The `zlib` pin is a file on Alpine's CDN, which keeps only the current package version. When Alpine
-  supersedes 1.4-r0 the URL returns 404 and the Grafana build fails until it is re-pinned. Nothing
+- The `zlib`, `libcrypto3` and `libssl3` pins are files on Alpine's CDN, which keeps only the current package
+  version. When Alpine supersedes 1.4-r0 (or 3.5.9-r1) the URL returns 404 and the Grafana build fails until it is re-pinned. Nothing
   watches for that.
 - A clean Grafana build left about 17.7 GB of BuildKit state in one local measurement, and the
   scanners need about 5 GB of databases. GitHub documents 14 GB of disk for the public
