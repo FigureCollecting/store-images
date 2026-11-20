@@ -173,9 +173,12 @@ ENV PATH=/usr/share/grafana/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bi
 # are switched off. The three grafana.com addresses in [grafana_com] and [grafana_net] point at a closed
 # loopback port, so the grafana.com proxy that any signed-in user can call (/api/gnet/*) cannot reach it.
 # Grafana Cloud Migration is off: it dials cms-<cluster>.grafana.net, or any host, from a pasted token.
+# Git Sync (the provisioning API's repository types) is off: it dials github.com, or any host an admin names.
+# Mounted provisioning files in GF_PATHS_PROVISIONING still load.
 # README.md lists every setting that can make the server call out, and its value here.
 ENV GF_PATHS_PLUGINS=/usr/share/grafana/plugins \
     GF_CLOUD_MIGRATION_ENABLED=false \
+    GF_PROVISIONING_ENABLED=false \
     GF_GRAFANA_COM_URL=http://127.0.0.1:9 \
     GF_GRAFANA_COM_API_URL=http://127.0.0.1:9/api \
     GF_GRAFANA_NET_URL=http://127.0.0.1:9 \

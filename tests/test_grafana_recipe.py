@@ -101,9 +101,19 @@ class ServerRebuildTest(unittest.TestCase):
                 self.assertRegex(readme, rf"`{name}[=`]")
                 if name not in ("GF_PATHS_PLUGINS", "GF_PLUGINS_ALLOW_LOADING_UNSIGNED_PLUGINS"):
                     section = next(s for s in ("cloud_migration", "grafana_com", "grafana_net", "analytics", "news",
-                                               "plugins", "security", "snapshots") if name.startswith(f"GF_{s.upper()}_"))
+                                               "plugins", "security", "snapshots", "provisioning")
+                                   if name.startswith(f"GF_{s.upper()}_"))
                     key = name[len(section) + 4:].lower()
                     self.assertRegex(smoke, rf"(?m)^\.{section}\.{key} \S+$")
+
+    def test_git_sync_is_off_so_the_server_cannot_dial_a_repository_host_and_file_provisioning_stays(self):
+        self.assertIn("    GF_PROVISIONING_ENABLED=false \\\n", read("Dockerfile.grafana"))
+        smoke = read("scripts/smoke-grafana.sh")
+        self.assertIn("\n.provisioning.enabled false\n", smoke)
+        self.assertIn("apis/provisioning.grafana.app/", smoke)
+        readme = read("README.md")
+        self.assertIn("`[provisioning] enabled`", readme)
+        self.assertNotIn("provisioned Git repositories reach the hosts", readme)
 
     def test_nothing_outside_the_data_log_and_temp_paths_is_writable_by_the_grafana_user(self):
         text = read("Dockerfile.grafana")

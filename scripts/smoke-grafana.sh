@@ -106,6 +106,7 @@ done <<'EOF'
 .security.disable_gravatar true
 .snapshots.external_enabled false
 .cloud_migration.enabled false
+.provisioning.enabled false
 .grafana_com.url http://127.0.0.1:9
 .grafana_com.api_url http://127.0.0.1:9/api
 .grafana_net.url http://127.0.0.1:9
@@ -128,6 +129,9 @@ docker logs "$name" 2>&1 | tail -n "+$((before + 1))" >"$work/migrate.log"
 tried=$(grep -cE 'lookup |no such host|network is unreachable|dial tcp|grafana\.(com|net)' "$work/migrate.log")
 check cloud-migration "POST /api/cloudmigration/migration with a token -> HTTP ${migrate:-none}, ${tried} attempts to reach its host logged" \
   test "$tried" = 0 -a "$migrate" = 404
+# Git Sync dials a repository host an admin names, so its API must not exist at all.
+gitsync=$(api /apis/provisioning.grafana.app/v0alpha1/namespaces/default/settings -o /dev/null -w '%{http_code}')
+check git-sync "GET /apis/provisioning.grafana.app/.../settings -> HTTP ${gitsync:-none}" test "$gitsync" = 404
 frontend=$(api /api/frontend/settings)
 got=$(jq -c '{hasUpdate: .buildInfo.hasUpdate, latestVersion: .buildInfo.latestVersion, newsFeedEnabled, pluginAdminEnabled, preinstalled: (.pluginCatalogPreinstalledPlugins | length)}' <<<"$frontend" 2>/dev/null)
 check frontend "/api/frontend/settings ${got:-no answer}" \

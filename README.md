@@ -90,6 +90,7 @@ back by the smoke test.
 | Setting | Upstream default | Reaches | This image |
 |---|---|---|---|
 | `[cloud_migration] enabled` | `true` | `cms-<cluster>.grafana.net`, or any host named in a token a server admin pastes | ours: `GF_CLOUD_MIGRATION_ENABLED=false`; the endpoints return 404 |
+| `[provisioning] enabled` | `true` | Git Sync: `github.com`, or any host an admin names in a repository URL | ours: `GF_PROVISIONING_ENABLED=false`; its endpoints return 404. Provisioning files mounted into `/etc/grafana/provisioning` still load |
 | `[grafana_com] url` | `https://grafana.com` | grafana.com sign-in and sign-out | ours: `GF_GRAFANA_COM_URL=http://127.0.0.1:9` |
 | `[grafana_com] api_url` | `https://grafana.com/api` | the `/api/gnet/*` proxy (any signed-in user), plugin catalog, installs and update checks, signing-key download, Cloud Migration's token calls | ours: `GF_GRAFANA_COM_API_URL=http://127.0.0.1:9/api` |
 | `[grafana_net] url` | `https://grafana.com` | older name of `[grafana_com] url` | ours: `GF_GRAFANA_NET_URL=http://127.0.0.1:9` |
@@ -115,20 +116,30 @@ back by the smoke test.
 Two more image defaults, not outbound switches: `GF_PATHS_PLUGINS` is the baked-in read-only directory,
 and `GF_PLUGINS_ALLOW_LOADING_UNSIGNED_PLUGINS` names the two rebuilt plugins.
 
-Data sources, alert contact points, sign-in providers and provisioned Git repositories reach the hosts
-an admin gives them; that is their purpose and no default covers it.
+Data sources, alert contact points and sign-in providers reach the hosts an admin gives them; that is
+their purpose and no default covers it. Git Sync is the exception, and it is off.
 
 With these defaults the server made no DNS query and no outbound connection in a run that called the
-avatar, grafana.com proxy, plugin install, external snapshot and Cloud Migration endpoints as admin
-and then opened 54 pages of the UI in a browser (checked 2026-11-18).
+avatar, grafana.com proxy, plugin install, external snapshot, Cloud Migration and Git Sync endpoints as
+admin and then opened 54 pages of the UI in a browser (checked 2026-11-19 on the built image).
 
 Known limits:
 
-- The operator's browser still fetches from third parties in two cases, both upstream behaviour. The
-  VictoriaLogs plugin's page (`/plugins/victoriametrics-logs-datasource`) shows its README, whose 20
-  images load from github.com. Upstream's frontend bundles FingerprintJS, which reports to
-  `openfpcdn.io` on about one page load in a thousand. A content security policy that limits
-  `img-src` and `connect-src` to `'self'` should stop both; it is not set here and not tested.
+- The operator's browser still fetches from third parties in at least three cases, all upstream
+  behaviour. The VictoriaLogs plugin's page (`/plugins/victoriametrics-logs-datasource`) shows its
+  README, whose 20 images load from github.com. Upstream's frontend bundles FingerprintJS, which
+  reports to `openfpcdn.io` on some page loads (the code draws a random number; two hits were seen in
+  about six 54-page walks). A Geomap panel on its default base layer loads map tiles from
+  `basemaps.cartocdn.com`. Other panels may name other hosts. A content security policy that limits
+  `img-src` and `connect-src` to `'self'` should stop these; it is not set here and not tested.
+- The server-side check ran with a watcher on the container's sockets (any address, any port) as well as a
+  DNS and TCP sink; the earlier runs saw only DNS and ports 80 and 443.
+- The build guard that finds paths the Grafana user could write skips symlinks, so a root-owned symlink
+  in `PATH` that points into the data volume would pass. The image has none.
+- `GF_INSTALL_PLUGINS` with `GF_INSTALL_PLUGINS_FORCE` runs `grafana cli plugins install`, whose
+  repository address is fixed in the code at `https://grafana.com/api/plugins`, not `[grafana_com]
+  api_url`. It needs the operator to set both, it is deprecated, and it fails on the read-only plugin
+  directory.
 - `GF_AWS_PROFILES` no longer works: the entrypoint cannot write `/usr/share/grafana/.aws/credentials`
   and stops. No bundled data source that reads it is left in the image.
 - Provisioning files must be mounted; the Grafana user cannot create them in `/etc/grafana/provisioning`.
