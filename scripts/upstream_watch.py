@@ -82,6 +82,13 @@ def watch_only(path):
     return os.path.basename(os.path.dirname(os.path.abspath(path))) == "watch"
 
 
+def stays(rebuilt):
+    """'The a and b rebuilds stay.' (one name: 'The a rebuild stays.'; none: 'The images/ rebuild stays.')"""
+    if len(rebuilt) > 1:
+        return f"The {', '.join(rebuilt[:-1])} and {rebuilt[-1]} rebuilds stay."
+    return f"The {rebuilt[0] if rebuilt else 'images/'} rebuild stays."
+
+
 def check(name, env, fetch, key="UPSTREAM", read_gomod=None, rebuilt=None):
     """Return (status, message) for <key>_REPO at <key>_TAG: 0 current, 1 newer upstream release, 2 cannot tell.
 
@@ -104,7 +111,7 @@ def check(name, env, fetch, key="UPSTREAM", read_gomod=None, rebuilt=None):
         action = env.get("WATCH_ACTION", "archive")
         if rebuilt is not None:
             step = (f"{name} is watch-only: check its image's scan, re-pin the store, then bump UPSTREAM_TAG in "
-                    f"watch/{name}.env. The {', '.join(rebuilt) or 'images/'} rebuild stays.")
+                    f"watch/{name}.env. {stays(rebuilt)}")
         else:
             step = ACTIONS[action].format(image=name)
         # Only a rebuild recipe has a server rebuild to drop; an archive-on-release image (victoria-traces also

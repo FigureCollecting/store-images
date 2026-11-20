@@ -162,8 +162,8 @@ Known limits:
   version. When Alpine supersedes 1.4-r0 (or 3.5.9-r1) the URL returns 404 and the Grafana build fails until it is re-pinned. Nothing
   watches for that.
 - A clean Grafana build left about 17.7 GB of BuildKit state in one local measurement, and the
-  scanners need about 5 GB of databases. GitHub documents 14 GB of disk for the public
-  `ubuntu-24.04` runner, so the `grafana` leg may not fit; CI has not run it yet.
+  scanners need about 5 GB of databases. CI ran the `grafana` leg on the GitHub runner at `a3daa23`
+  and it passed (scan gate, smoke 52/52). The leg takes about 10 minutes.
 - The upstream watch reads only the `require` lines of the new release's root `go.mod`. A `replace`
   of thrift back to an older version would still read as "drop".
 - A `+security-NN` release cannot be the image tag as written, because `+` is not allowed in one.
@@ -219,5 +219,5 @@ Known limits:
   image's scan, re-pin the store and bump the tag in `watch/`; the rebuilds in `images/` stay.
   For Grafana it also watches the two data sources, and a newer release means re-pin and rebuild.
 
-Consumers pin by digest. The VictoriaLogs and VictoriaTraces packages must be public for anonymous
+Consumers pin by digest. The VictoriaTraces package must be public for anonymous
 pulls; the Grafana package is private and is pulled with a pull secret.

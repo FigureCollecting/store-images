@@ -148,6 +148,31 @@ RUN --network=none GOPROXY=off go build -trimpath -buildvcs=false \
 """
 
 
+class DefinitionSetsEveryBuildArgTest(unittest.TestCase):
+    # scripts/build.sh passes only the keys a definition sets, so a missing one would silently build another image.
+    SUPPLIED_BY_BUILD_SH = {"FC_COMMIT", "BUILD_DATE", "CREATED"}
+
+    def test_every_arg_without_a_default_is_set_by_the_definition(self):
+        for name in definitions():
+            env = upstream_watch.read_env(os.path.join(ROOT, "images", f"{name}.env"))
+            text = read(dockerfile_of(name)).replace("\\\n", " ")
+            declared, defaulted = set(), set()
+            for match in re.finditer(r"(?im)^\s*ARG\s+(.+)$", text):
+                for word in match.group(1).split():
+                    (defaulted if "=" in word else declared).add(word.split("=", 1)[0])
+            needed = declared - defaulted - self.SUPPLIED_BY_BUILD_SH
+            self.assertTrue(needed, name)
+            self.assertEqual(sorted(needed - set(env)), [], f"images/{name}.env does not set these ARGs")
+
+
+class StaysWordingTest(unittest.TestCase):
+    def test_the_rebuild_sentence_reads_as_plain_english(self):
+        self.assertEqual(upstream_watch.stays(["a", "b", "c"]), "The a, b and c rebuilds stay.")
+        self.assertEqual(upstream_watch.stays(["a", "b"]), "The a and b rebuilds stay.")
+        self.assertEqual(upstream_watch.stays(["a"]), "The a rebuild stays.")
+        self.assertEqual(upstream_watch.stays([]), "The images/ rebuild stays.")
+
+
 class TracesPinsTest(unittest.TestCase):
     def setUp(self):
         self.env = upstream_watch.read_env(os.path.join(ROOT, "images", "victoria-traces.env"))
@@ -367,7 +392,7 @@ class InventoryTest(unittest.TestCase):
         # Archiving this repository on a victoria-logs release would drop the rebuilds the stores run.
         self.assertIn("victoria-logs is watch-only", out.getvalue())
         self.assertIn("bump UPSTREAM_TAG in watch/victoria-logs.env", out.getvalue())
-        self.assertIn("The grafana, victoria-traces rebuild stays.", out.getvalue())
+        self.assertIn("The grafana and victoria-traces rebuilds stay.", out.getvalue())
         self.assertNotIn("archive this repository", out.getvalue())
         self.assertNotIn("Re-pin images/", out.getvalue())
 
