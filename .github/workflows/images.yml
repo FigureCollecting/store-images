@@ -1,6 +1,6 @@
 name: images
 
-# Pull requests: build both images, scan them (trivy AND grype, fail on any fixable HIGH/CRITICAL),
+# Pull requests: build every image, scan them (trivy AND grype, fail on any fixable HIGH/CRITICAL),
 # and smoke-run them. No registry push, no secrets.
 # Push to main: the same, then publish the scanned image to ghcr.io with SBOM + provenance attestations.
 on:
@@ -40,7 +40,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        app: [victoria-logs, victoria-traces]
+        app: [victoria-traces]
     env:
       APP: ${{ matrix.app }}
     steps:
@@ -68,7 +68,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        app: [victoria-logs, victoria-traces]
+        app: [victoria-traces]
     env:
       APP: ${{ matrix.app }}
     steps:

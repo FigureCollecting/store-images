@@ -1,50 +1,59 @@
 # store-images
 
-Stopgap rebuilds of the VictoriaLogs and VictoriaTraces container images used by FigureCollecting.
-Each image is built from an upstream release tag with exactly one change: the Go toolchain is moved
-to the patch release that upstream has already adopted on its main branch. Nothing else is changed.
+Stopgap rebuild of the VictoriaTraces container image used by FigureCollecting. The image is built from
+an upstream release tag with two changes: the Go toolchain is moved to the current patch release, and one
+module is moved to its fixed version (go.mod and go.sum only). Nothing else is changed.
 
-The images are published as `ghcr.io/figurecollecting/victoria-logs` and
-`ghcr.io/figurecollecting/victoria-traces`, tagged `<upstream tag>-fc<N>`.
+The image is published as `ghcr.io/figurecollecting/victoria-traces`, tagged `<upstream tag>-fc<N>`.
 
-This repository will be archived once upstream publishes releases built with the fixed Go version.
+This repository will be archived once upstream publishes releases built with the fixed versions.
 At that point, consumers pin upstream's own images again.
 
 ## What is rebuilt
 
-| Image | Upstream tag (commit) | Upstream Go | Ours | Upstream's Go fix on master |
-|---|---|---|---|---|
-| victoria-logs | v1.53.0 (915d91904b) | 1.27.1 | 1.27.3 | VictoriaLogs 06d56702 |
-| victoria-traces | v0.12.1 (7b13fef2f) | 1.27.2 | 1.27.3 | VictoriaTraces 8586f7c8 |
+| Image | Upstream tag (commit) | Upstream Go | Ours | Module moved | Fixes |
+|---|---|---|---|---|---|
+| victoria-traces | v0.13.0 (f0295d1f7) | 1.27.3 | 1.27.4 | klauspost/compress v1.20.1 -> v1.20.4 | CVE-2026-97054 (Go), CVE-2026-116591 (compress) |
+
+Upstream's master had neither change on 2026-11-20. v1.20.4 is the current compress release and the one
+VictoriaLogs v1.54.0 ships.
+
+VictoriaLogs is no longer rebuilt here. Upstream's v1.54.0 image is built with Go 1.27.4 and
+klauspost/compress v1.20.4 and passed the scan gate on 2026-11-20, so consumers pin upstream's image.
+The last recipe (v1.53.0-fc1) is in this repository's history; the published package stays.
 
 ## Layout
 
-- `images/<app>.env`: the definition (upstream repo, tag, commit, Go version, our `FC_REVISION`).
-- `patches/<app>.patch`: the only source change, the `go` line in `go.mod` and `GO_BUILDER_IMAGE` in
-  `deployment/docker/Makefile`, as in upstream's fix commit.
+- `images/<app>.env`: the definition (upstream repo, tag, commit and image, upstream's Go, our Go, the
+  module and version the patch moves, our `FC_REVISION`).
+- `patches/<app>.patch`: the only source change, the module's line in `go.mod` and its two `go.sum` lines.
 - `Dockerfile`: upstream's linux/amd64 build (`-trimpath`, static, `netgo osusergo`, CGO on as upstream
-  does for amd64, same distroless runtime pin, same binary path), with the builder and runtime pinned by
-  digest. The build checks the upstream commit, the patch and the resulting Go version.
+  does for amd64, same distroless runtime pin, same binary path), with the builder, the runtime and
+  upstream's image pinned by digest. The build checks the upstream commit, the patch footprint and the Go
+  version, builds from the go.sum-verified module cache with no network, and fails unless the binary's
+  `go version -m` matches the binary in upstream's image except for the Go version and the moved module.
 - `scripts/build.sh` builds; `scripts/scan.sh` runs trivy and grype; `scripts/gate.py` fails on any
   HIGH or CRITICAL finding that has a fix, from either scanner, with no ignore list; `scripts/smoke.sh`
-  runs the image and checks `/health`, the version string and `go version -m`;
+  runs the image, checks `/health`, writes a gzip-compressed OTLP span and reads it back through the
+  Jaeger API, and checks the version string and `go version -m`;
   `scripts/upstream_watch.py` reports a newer upstream release.
 
 ## Local use
 
     docker buildx create --name store-images --driver docker-container --use
-    scripts/build.sh victoria-logs archive ~/tmp/store-images/victoria-logs.tar
-    scripts/scan.sh victoria-logs ~/tmp/store-images/victoria-logs.tar ~/tmp/store-images/scan-vl
-    scripts/smoke.sh victoria-logs ~/tmp/store-images/victoria-logs.tar
+    scripts/build.sh victoria-traces archive ~/tmp/store-images/victoria-traces.tar
+    scripts/scan.sh victoria-traces ~/tmp/store-images/victoria-traces.tar ~/tmp/store-images/scan-vt
+    scripts/smoke.sh victoria-traces ~/tmp/store-images/victoria-traces.tar
     python3 -m unittest discover -s tests
 
 ## CI
 
-- Pull requests: unit tests, then build, scan gate and smoke for both images. No push, no secrets.
+- Pull requests: unit tests, then build, scan gate and smoke for every image. No push, no secrets.
 - Push to `main`: the same, then publish. The image is pushed by digest with SBOM and provenance
   attestations, its linux/amd64 manifest is checked against the one that was scanned, and only then is
   it tagged. An existing tag is never overwritten; bump `FC_REVISION` to publish a new build.
 - Weekly `upstream-watch`: fails if upstream has a stable release newer than our base tag. That is the
-  signal to re-pin consumers to upstream's image (check that its Go is fixed) and archive this repo.
+  signal to check the new release's Go and modules, then either re-pin consumers to upstream's image and
+  archive this repo, or move the recipe to the new tag.
 
 Consumers pin by digest. The packages must be public for anonymous pulls.

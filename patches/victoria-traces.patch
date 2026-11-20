@@ -1,25 +1,28 @@
-diff --git a/deployment/docker/Makefile b/deployment/docker/Makefile
-index 3bee8a334..6e58cc199 100644
---- a/deployment/docker/Makefile
-+++ b/deployment/docker/Makefile
-@@ -5,7 +5,7 @@ DOCKER_NAMESPACE ?= victoriametrics
- 
- ROOT_IMAGE ?= gcr.io/distroless/static:latest@sha256:47b2d72ff90843eb8a768b5c2f89b40741843b639d065b9b937b07cd59b479c6
- 
--GO_BUILDER_IMAGE := golang:1.27.2
-+GO_BUILDER_IMAGE := golang:1.27.3
- 
- BUILDER_IMAGE := local/builder:2.0.0-$(shell echo $(GO_BUILDER_IMAGE) | tr :/ __)-1
- DOCKER ?= docker
 diff --git a/go.mod b/go.mod
-index 0a39113ec..6e18e650d 100644
+index ea9dea0..a90a59c 100644
 --- a/go.mod
 +++ b/go.mod
-@@ -1,6 +1,6 @@
- module github.com/VictoriaMetrics/VictoriaTraces
- 
--go 1.27.2
-+go 1.27.3
- 
- require (
- 	github.com/VictoriaMetrics/VictoriaLogs v1.121.1-0.20260716015338-c945d2949e98 // v1.52.0
+@@ -9,7 +9,7 @@ require (
+ 	github.com/VictoriaMetrics/metrics v1.44.1
+ 	github.com/cespare/xxhash/v2 v2.3.0
+ 	github.com/google/go-cmp v0.7.0
+-	github.com/klauspost/compress v1.20.1
++	github.com/klauspost/compress v1.20.4
+ 	github.com/valyala/bytebufferpool v1.0.0
+ 	github.com/valyala/fastjson v1.6.10
+ 	github.com/valyala/fastrand v1.1.0
+diff --git a/go.sum b/go.sum
+index 47afc90..0cbd295 100644
+--- a/go.sum
++++ b/go.sum
+@@ -14,8 +14,8 @@ github.com/golang/snappy v1.0.0 h1:Oy607GVXHs7RtbggtPBnr2RmDArIsAefDwvrdWvRhGs=
+ github.com/golang/snappy v1.0.0/go.mod h1:/XxbfmMg8lxefKM7IXC3fBNl/7bRcc72aCRzEWrmP2Q=
+ github.com/google/go-cmp v0.7.0 h1:wk8382ETsv4JYUZwIsn6YpYiWiBsYLSJiTsyBybVuN8=
+ github.com/google/go-cmp v0.7.0/go.mod h1:pXiqmnSA92OHEEa9HXL2W4E7lf9JzCmGVUdgjX3N/iU=
+-github.com/klauspost/compress v1.20.1 h1:T7kKElXUMXrUJ2E9QhQhxFtcK5rPyLdsGZvdbLMPdiQ=
+-github.com/klauspost/compress v1.20.1/go.mod h1:LUdAzn7YLVvxLpc7y3V1m40wESHTgc1422pwwBSKYuI=
++github.com/klauspost/compress v1.20.4 h1:dD0v/bvxtjCBqQu6sx1TNWkalEY5lNTIe+HY9w8TeNI=
++github.com/klauspost/compress v1.20.4/go.mod h1:LUdAzn7YLVvxLpc7y3V1m40wESHTgc1422pwwBSKYuI=
+ github.com/valyala/bytebufferpool v1.0.0 h1:GqA5TC/0021Y/b9FG4Oi9Mr3q7XYx6KllzawFIhcdPw=
+ github.com/valyala/bytebufferpool v1.0.0/go.mod h1:6bBcMArwyJ5K/AmCkWv1jt77kVWyCJ6HpOuEn7z0Csc=
+ github.com/valyala/fastjson v1.6.10 h1:/yjJg8jaVQdYR3arGxPE2X5z89xrlhS0eGXdv+ADTh4=
