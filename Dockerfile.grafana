@@ -1,0 +1,234 @@
+# Grafana OSS for the internal log and trace viewer: upstream's image, pinned by digest, with
+#   - victoriametrics-logs-datasource baked in from its release zip (pinned version, sha256-verified);
+#   - every bundled data source we do not use removed (only Jaeger stays: it reads VictoriaTraces'
+#     /select/jaeger), and the image flattened so the removed files are in no layer; both plugin trees
+#     are root-owned and read-only for the Grafana user;
+#   - the backends of the two data sources rebuilt from their release tags with the dependency fixes
+#     upstream has on main but has not released (patches/grafana-jaeger.patch, patches/grafana-vlogs.patch),
+#     using the flags of upstream's own release binaries; nothing else of the plugins is changed;
+#   - Grafana's own server binary rebuilt from the public release tag with one module moved to its fixed
+#     version (patches/grafana-server.patch); the frontend and everything else are upstream's files;
+#   - Alpine's zlib, libcrypto3 and libssl3 moved to the fixed packages (pinned files, sha256-verified);
+#   - telemetry, update checks, the news feed, the plugin catalog, run-time plugin installs and Grafana
+#     Cloud Migration off by default;
+#   - the entrypoint and everything else outside the data, log and temp paths root-owned and read-only
+#     for the Grafana user.
+# Build arguments come from images/grafana.env via scripts/build.sh; target = grafana.
+# Every RUN has no network, except the six that fetch a pinned source tree or its go.sum-verified modules.
+ARG GRAFANA_IMAGE=docker.io/grafana/grafana:13.3.1@sha256:0615ec4fbd4072004b7d86b46ded63013a74b7d6eb1119273dd89e8fa25c13cf
+ARG GO_IMAGE=docker.io/library/golang:1.27.4@sha256:205c7636d74e0ffbe3d007162df7d74f859f5a8c8322dfb9f907977686c126cf
+ARG VLOGS_DS_ZIP=https://github.com/VictoriaMetrics/victorialogs-datasource/releases/download/v0.34.0/victoriametrics-logs-datasource-v0.34.0.zip
+ARG VLOGS_DS_SHA256=sha256:6fc61446097a525e826f2ddb6746723f85447845c95a7b1a99624e84d4b2e237
+ARG ZLIB_APK=https://dl-cdn.alpinelinux.org/alpine/v3.24/main/x86_64/zlib-1.4-r0.apk
+ARG ZLIB_SHA256=sha256:7b05bc778b8b25cd880835b40114182bd4d1581717504d0129c810c0a14291cb
+ARG LIBCRYPTO3_APK=https://dl-cdn.alpinelinux.org/alpine/v3.24/main/x86_64/libcrypto3-3.5.9-r1.apk
+ARG LIBCRYPTO3_SHA256=sha256:042026082cc9bc7872d1baa81755c50efa70b05f03b5369fdc5f0a1303009720
+ARG LIBSSL3_APK=https://dl-cdn.alpinelinux.org/alpine/v3.24/main/x86_64/libssl3-3.5.9-r1.apk
+ARG LIBSSL3_SHA256=sha256:18c5778cbe52e1991303f8531970b05d4e6e036ea08349322f7422f42a689dc7
+
+FROM ${GO_IMAGE} AS go
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+ARG GO_VERSION
+ENV GOTOOLCHAIN=local GOFLAGS=-mod=readonly CGO_ENABLED=0 GOOS=linux GOARCH=amd64 GOAMD64=v1
+RUN --network=none test "$(go env GOVERSION)" = "go${GO_VERSION}"
+WORKDIR /src
+
+FROM ${GRAFANA_IMAGE} AS upstream
+
+# Grafana's server: the public release tag with ONE module moved (patches/grafana-server.patch), built with
+# upstream's settings (CGO off, -trimpath, no tags: `go version -m` on upstream's binary) and a newer Go
+# patch release than upstream's (GO_VERSION against UPSTREAM_GO_VERSION).
+# The build fails unless the result is built by that Go, has the patched version and is otherwise built
+# from exactly the modules, at exactly the versions and hashes, of upstream's own binary.
+# `grafana server -v` reports the tag's commit and a branch that names the patch.
+FROM go AS server
+ARG UPSTREAM_REPO UPSTREAM_TAG UPSTREAM_COMMIT UPSTREAM_BUILD_STAMP UPSTREAM_PATCH_MODULE UPSTREAM_PATCH_VERSION \
+    UPSTREAM_GO_VERSION GO_VERSION
+RUN git -c advice.detachedHead=false clone --quiet --depth 1 --branch "${UPSTREAM_TAG}" "${UPSTREAM_REPO}" . \
+ && test "$(git rev-parse HEAD)" = "${UPSTREAM_COMMIT}"
+COPY patches/grafana-server.patch /tmp/deps.patch
+RUN --network=none git apply --check /tmp/deps.patch && git apply /tmp/deps.patch \
+ && test "$(git diff --numstat | tr '\t\n' '  ')" = "1 1 go.mod 2 2 go.sum " \
+ && grep -qxP "\t${UPSTREAM_PATCH_MODULE} ${UPSTREAM_PATCH_VERSION} // indirect" go.mod
+RUN go list -deps ./pkg/cmd/grafana >/dev/null
+COPY --from=upstream /usr/share/grafana/bin/grafana /tmp/upstream
+RUN --network=none GOPROXY=off go build -buildvcs=false -trimpath \
+      -ldflags "-X main.version=${UPSTREAM_TAG#v} -X main.commit=${UPSTREAM_COMMIT} -X main.buildBranch=${UPSTREAM_TAG}-fc-${UPSTREAM_PATCH_MODULE##*/}-${UPSTREAM_PATCH_VERSION} -X main.buildstamp=${UPSTREAM_BUILD_STAMP}" \
+      -o /out/grafana ./pkg/cmd/grafana \
+ && go version -m /out/grafana >/tmp/buildinfo && go version -m /tmp/upstream >/tmp/upstream-buildinfo \
+ && test "$(head -n 1 /tmp/buildinfo)" = "/out/grafana: go${GO_VERSION}" \
+ && test "$(head -n 1 /tmp/upstream-buildinfo)" = "/tmp/upstream: go${UPSTREAM_GO_VERSION}" \
+ && grep -qP "^\tdep\t${UPSTREAM_PATCH_MODULE}\t${UPSTREAM_PATCH_VERSION}\t" /tmp/buildinfo \
+ && grep -cP "^\tdep\t${UPSTREAM_PATCH_MODULE}\t" /tmp/upstream-buildinfo | grep -qx 1 \
+ && diff <(tail -n +2 /tmp/upstream-buildinfo | grep -vP "^\tdep\t${UPSTREAM_PATCH_MODULE}\t") \
+         <(tail -n +2 /tmp/buildinfo | grep -vP "^\tdep\t${UPSTREAM_PATCH_MODULE}\t") \
+ && test "$(git status --porcelain --untracked-files=no | tr '\n' ' ')" = " M go.mod  M go.sum "
+
+# Jaeger data source backend: its release tag with golang.org/x/net moved to the fixed version.
+FROM go AS jaeger
+ARG JAEGER_DS_REPO JAEGER_DS_TAG JAEGER_DS_COMMIT JAEGER_DS_BUILD_TIME XNET_VERSION GO_VERSION
+RUN git -c advice.detachedHead=false clone --quiet --depth 1 --branch "${JAEGER_DS_TAG}" "${JAEGER_DS_REPO}" . \
+ && test "$(git rev-parse HEAD)" = "${JAEGER_DS_COMMIT}"
+COPY patches/grafana-jaeger.patch /tmp/deps.patch
+RUN --network=none git apply --check /tmp/deps.patch && git apply /tmp/deps.patch \
+ && test "$(git diff --numstat | tr '\t\n' '  ')" = "1 1 go.mod 2 2 go.sum " \
+ && grep -qxP "\tgolang.org/x/net ${XNET_VERSION} // indirect" go.mod
+RUN go mod download
+RUN --network=none GOPROXY=off go build -tags arrow_json_stdlib \
+      -ldflags "-w -s -extldflags \"-static\" -X 'github.com/grafana/grafana-plugin-sdk-go/build/buildinfo.buildInfoJSON={\"time\":${JAEGER_DS_BUILD_TIME},\"pluginID\":\"jaeger\",\"version\":\"${JAEGER_DS_TAG#v}\"}' -X 'main.pluginID=jaeger' -X 'main.version=${JAEGER_DS_TAG#v}'" \
+      -o /out/backend ./pkg \
+ && go version -m /out/backend >/tmp/buildinfo \
+ && test "$(head -n 1 /tmp/buildinfo)" = "/out/backend: go${GO_VERSION}" \
+ && grep -qP "^\tdep\tgolang.org/x/net\t${XNET_VERSION}\t" /tmp/buildinfo \
+ && grep -qP "^\tbuild\tvcs.revision=${JAEGER_DS_COMMIT}$" /tmp/buildinfo \
+ && test "$(git status --porcelain --untracked-files=no | tr '\n' ' ')" = " M go.mod  M go.sum "
+
+# VictoriaLogs data source backend: its release tag with golang.org/x/net (and the golang.org/x/sys and
+# golang.org/x/text it requires) and klauspost/compress moved to fixed versions, built with the fixed Go.
+# The tag vendors its modules; the patched go.mod is built from the module cache instead (-mod=readonly).
+FROM go AS vlogs
+ARG VLOGS_DS_REPO VLOGS_DS_TAG VLOGS_DS_COMMIT VLOGS_DS_BUILD_TIME XNET_VERSION COMPRESS_VERSION GO_VERSION
+RUN git -c advice.detachedHead=false clone --quiet --depth 1 --branch "${VLOGS_DS_TAG}" "${VLOGS_DS_REPO}" . \
+ && test "$(git rev-parse HEAD)" = "${VLOGS_DS_COMMIT}"
+COPY patches/grafana-vlogs.patch /tmp/deps.patch
+RUN --network=none git apply --check /tmp/deps.patch && git apply /tmp/deps.patch \
+ && test "$(git diff --numstat | tr '\t\n' '  ')" = "4 4 go.mod 8 8 go.sum " \
+ && grep -qxP "\tgolang.org/x/net ${XNET_VERSION} // indirect" go.mod \
+ && grep -qxP "\tgithub.com/klauspost/compress ${COMPRESS_VERSION}" go.mod
+RUN go mod download
+RUN --network=none GOPROXY=off go build -tags arrow_json_stdlib \
+      -ldflags "-w -s -extldflags \"-static\" -X 'github.com/grafana/grafana-plugin-sdk-go/build/buildinfo.buildInfoJSON={\"time\":${VLOGS_DS_BUILD_TIME},\"pluginID\":\"victoriametrics-logs-datasource\",\"version\":\"${VLOGS_DS_TAG#v}\"}' -X 'main.pluginID=victoriametrics-logs-datasource' -X 'main.version=${VLOGS_DS_TAG#v}'" \
+      -o /out/backend ./pkg \
+ && go version -m /out/backend >/tmp/buildinfo \
+ && test "$(head -n 1 /tmp/buildinfo)" = "/out/backend: go${GO_VERSION}" \
+ && grep -qP "^\tdep\tgolang.org/x/net\t${XNET_VERSION}\t" /tmp/buildinfo \
+ && grep -qP "^\tdep\tgithub.com/klauspost/compress\t${COMPRESS_VERSION}\t" /tmp/buildinfo \
+ && grep -qP "^\tbuild\tvcs.revision=${VLOGS_DS_COMMIT}$" /tmp/buildinfo \
+ && test "$(git status --porcelain --untracked-files=no | tr '\n' ' ')" = " M go.mod  M go.sum "
+
+FROM upstream AS rootfs
+ARG UPSTREAM_TAG UPSTREAM_COMMIT UPSTREAM_PATCH_MODULE UPSTREAM_PATCH_VERSION \
+    VLOGS_DS_TAG JAEGER_DS_TAG VLOGS_DS_ZIP VLOGS_DS_SHA256 ZLIB_APK ZLIB_SHA256 \
+    LIBCRYPTO3_APK LIBCRYPTO3_SHA256 LIBSSL3_APK LIBSSL3_SHA256
+USER root
+ADD --checksum=${VLOGS_DS_SHA256} ${VLOGS_DS_ZIP} /tmp/vlogs.zip
+ADD --checksum=${ZLIB_SHA256} ${ZLIB_APK} /tmp/zlib.apk
+ADD --checksum=${LIBCRYPTO3_SHA256} ${LIBCRYPTO3_APK} /tmp/libcrypto3.apk
+ADD --checksum=${LIBSSL3_SHA256} ${LIBSSL3_APK} /tmp/libssl3.apk
+COPY --from=jaeger /out/backend /tmp/jaeger-backend
+COPY --from=vlogs /out/backend /tmp/vlogs-backend
+COPY --from=server /out/grafana /tmp/grafana-server
+# A rebuilt backend no longer matches its plugin's signed MANIFEST.txt, so the manifest goes and the two
+# plugins are allowed to load unsigned below. Nothing then checks their files at start, so both plugin
+# trees become root-owned and read-only for the Grafana user (upstream ships the bundled one world-writable).
+# The VictoriaLogs zip also carries backends for other platforms, which are removed.
+# apk writes the time of day into /var/log/apk.log; it is told not to, so that the image is reproducible.
+# Upstream ships the entrypoint writable by group 0, the group of the Grafana user, who could then change
+# what the next start loads. It and the other paths upstream leaves writable outside the data, log and
+# temp directories become root-owned and read-only, and the build fails if any such path is left.
+RUN --network=none set -eu; \
+    apklog="$(sha256sum /var/log/apk.log)"; \
+    test "$(grafana --version)" = "grafana version ${UPSTREAM_TAG#v}"; \
+    cat /tmp/grafana-server >/usr/share/grafana/bin/grafana; \
+    test "$(grafana --version)" = "grafana version ${UPSTREAM_TAG#v}"; \
+    test "$(grafana server -v)" = "Version ${UPSTREAM_TAG#v} (commit: ${UPSTREAM_COMMIT}, branch: ${UPSTREAM_TAG}-fc-${UPSTREAM_PATCH_MODULE##*/}-${UPSTREAM_PATCH_VERSION})"; \
+    apk add --no-network --no-logfile /tmp/zlib.apk /tmp/libcrypto3.apk /tmp/libssl3.apk; \
+    apk info -v | grep -qx "$(basename "${ZLIB_APK}" .apk)"; \
+    apk info -v | grep -qx "$(basename "${LIBCRYPTO3_APK}" .apk)"; \
+    apk info -v | grep -qx "$(basename "${LIBSSL3_APK}" .apk)"; \
+    test "$(sha256sum /var/log/apk.log)" = "${apklog}"; \
+    cd /usr/share/grafana/data/plugins-bundled; \
+    find . -mindepth 1 -maxdepth 1 ! -name canvas ! -name jaeger -exec rm -r {} +; \
+    test "$(ls | tr '\n' ' ')" = "canvas jaeger "; \
+    grep -q "\"version\": \"${JAEGER_DS_TAG#v}\"" jaeger/plugin.json; \
+    test -x jaeger/gpx_grafana-jaeger-datasource_linux_amd64; \
+    install -m 0755 /tmp/jaeger-backend jaeger/gpx_grafana-jaeger-datasource_linux_amd64; \
+    rm jaeger/MANIFEST.txt; \
+    chown -R root:root .; chmod -R u=rwX,go=rX .; \
+    mkdir /usr/share/grafana/plugins; \
+    unzip -q /tmp/vlogs.zip -d /usr/share/grafana/plugins; \
+    cd /usr/share/grafana/plugins; \
+    test "$(ls | tr '\n' ' ')" = "victoriametrics-logs-datasource "; \
+    cd victoriametrics-logs-datasource; \
+    grep -q "\"version\": \"${VLOGS_DS_TAG#v}\"" plugin.json; \
+    test -x victoriametrics_logs_backend_plugin_linux_amd64; \
+    rm victoriametrics_logs_backend_plugin_* MANIFEST.txt; \
+    install -m 0755 /tmp/vlogs-backend victoriametrics_logs_backend_plugin_linux_amd64; \
+    chown -R root:root /usr/share/grafana/plugins; chmod -R u=rwX,go=rX /usr/share/grafana/plugins; \
+    test -z "$(find /usr/share/grafana/plugins /usr/share/grafana/data/plugins-bundled ! -type l \( ! -user root -o -perm -0020 -o -perm -0002 \))"; \
+    chmod 0755 /run.sh /etc/network/if-up.d/dad; \
+    chown -R root:root /etc/grafana/provisioning /home/grafana /usr/share/grafana/.aws; \
+    chmod -R u=rwX,go=rX /etc/grafana/provisioning /home/grafana /usr/share/grafana/.aws; \
+    test -z "$(find / -xdev \( -path /proc -o -path /sys -o -path /dev -o -path /tmp -o -path /var/tmp -o -path /var/lib/grafana -o -path /var/log/grafana \) -prune -o ! -type l \( -user 472 -o -group 0 -perm -0020 -o -perm -0002 \) -print)"; \
+    rm /tmp/vlogs.zip /tmp/zlib.apk /tmp/libcrypto3.apk /tmp/libssl3.apk /tmp/jaeger-backend /tmp/vlogs-backend /tmp/grafana-server
+
+# One layer holds the whole final file system, so the removed files are not in the image at all.
+# (WORKDIR below adds a second, empty layer.)
+FROM scratch AS grafana
+ARG GRAFANA_IMAGE UPSTREAM_REPO UPSTREAM_TAG UPSTREAM_COMMIT UPSTREAM_FIX_COMMIT \
+    UPSTREAM_PATCH_MODULE UPSTREAM_PATCH_VERSION VLOGS_DS_REPO VLOGS_DS_TAG VLOGS_DS_COMMIT VLOGS_DS_FIX_COMMIT \
+    JAEGER_DS_REPO JAEGER_DS_TAG JAEGER_DS_COMMIT JAEGER_DS_FIX_COMMIT XNET_VERSION COMPRESS_VERSION \
+    GO_VERSION FC_REVISION FC_COMMIT CREATED DOCS_URL
+COPY --from=rootfs / /
+# Upstream's runtime settings, restated because the image starts from scratch.
+ENV PATH=/usr/share/grafana/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+    GF_PATHS_CONFIG=/etc/grafana/grafana.ini \
+    GF_PATHS_DATA=/var/lib/grafana \
+    GF_PATHS_HOME=/usr/share/grafana \
+    GF_PATHS_LOGS=/var/log/grafana \
+    GF_PATHS_PROVISIONING=/etc/grafana/provisioning
+# Ours. Plugins load from the read-only directory baked in above, not from the data volume; nothing is
+# installed or updated at run time. The periodic calls to grafana.com, stats.grafana.org and gravatar.com
+# are switched off. The three grafana.com addresses in [grafana_com] and [grafana_net] point at a closed
+# loopback port, so the grafana.com proxy that any signed-in user can call (/api/gnet/*) cannot reach it.
+# Grafana Cloud Migration is off: it dials cms-<cluster>.grafana.net, or any host, from a pasted token.
+# Git Sync (the provisioning API's repository types) is off: it dials github.com, or any host an admin names.
+# Mounted provisioning files in GF_PATHS_PROVISIONING still load.
+# README.md lists every setting that can make the server call out, and its value here.
+ENV GF_PATHS_PLUGINS=/usr/share/grafana/plugins \
+    GF_CLOUD_MIGRATION_ENABLED=false \
+    GF_PROVISIONING_ENABLED=false \
+    GF_GRAFANA_COM_URL=http://127.0.0.1:9 \
+    GF_GRAFANA_COM_API_URL=http://127.0.0.1:9/api \
+    GF_GRAFANA_NET_URL=http://127.0.0.1:9 \
+    GF_PLUGINS_PREINSTALL_DISABLED=true \
+    GF_PLUGINS_PLUGIN_ADMIN_ENABLED=false \
+    GF_PLUGINS_PUBLIC_KEY_RETRIEVAL_DISABLED=true \
+    GF_PLUGINS_ALLOW_LOADING_UNSIGNED_PLUGINS=jaeger,victoriametrics-logs-datasource \
+    GF_ANALYTICS_REPORTING_ENABLED=false \
+    GF_ANALYTICS_CHECK_FOR_UPDATES=false \
+    GF_ANALYTICS_CHECK_FOR_PLUGIN_UPDATES=false \
+    GF_ANALYTICS_FEEDBACK_LINKS_ENABLED=false \
+    GF_NEWS_NEWS_FEED_ENABLED=false \
+    GF_SECURITY_DISABLE_GRAVATAR=true \
+    GF_SNAPSHOTS_EXTERNAL_ENABLED=false
+LABEL org.opencontainers.image.source="https://github.com/FigureCollecting/store-images" \
+      org.opencontainers.image.revision="${FC_COMMIT}" \
+      org.opencontainers.image.version="${UPSTREAM_TAG}-${FC_REVISION}" \
+      org.opencontainers.image.created="${CREATED}" \
+      org.opencontainers.image.title="grafana" \
+      org.opencontainers.image.description="Grafana OSS ${UPSTREAM_TAG}, server rebuilt with ${UPSTREAM_PATCH_MODULE} ${UPSTREAM_PATCH_VERSION}, with victoriametrics-logs-datasource ${VLOGS_DS_TAG} and Jaeger ${JAEGER_DS_TAG}, their backends rebuilt with Go ${GO_VERSION} and fixed dependencies; unused data sources removed" \
+      org.opencontainers.image.documentation="${DOCS_URL}" \
+      org.opencontainers.image.licenses="AGPL-3.0-only" \
+      org.opencontainers.image.vendor="FigureCollecting" \
+      org.opencontainers.image.base.name="${GRAFANA_IMAGE}" \
+      com.figurecollecting.upstream.source="${UPSTREAM_REPO}" \
+      com.figurecollecting.upstream.tag="${UPSTREAM_TAG}" \
+      com.figurecollecting.upstream.commit="${UPSTREAM_COMMIT}" \
+      com.figurecollecting.upstream.patch="${UPSTREAM_PATCH_MODULE} ${UPSTREAM_PATCH_VERSION}" \
+      com.figurecollecting.upstream.fix-commit="${UPSTREAM_FIX_COMMIT}" \
+      com.figurecollecting.go.version="${GO_VERSION}" \
+      com.figurecollecting.x-net.version="${XNET_VERSION}" \
+      com.figurecollecting.compress.version="${COMPRESS_VERSION}" \
+      com.figurecollecting.vlogs-datasource.source="${VLOGS_DS_REPO}" \
+      com.figurecollecting.vlogs-datasource.tag="${VLOGS_DS_TAG}" \
+      com.figurecollecting.vlogs-datasource.commit="${VLOGS_DS_COMMIT}" \
+      com.figurecollecting.vlogs-datasource.fix-commit="${VLOGS_DS_FIX_COMMIT}" \
+      com.figurecollecting.jaeger-datasource.source="${JAEGER_DS_REPO}" \
+      com.figurecollecting.jaeger-datasource.tag="${JAEGER_DS_TAG}" \
+      com.figurecollecting.jaeger-datasource.commit="${JAEGER_DS_COMMIT}" \
+      com.figurecollecting.jaeger-datasource.fix-commit="${JAEGER_DS_FIX_COMMIT}"
+USER 472
+WORKDIR /usr/share/grafana
+EXPOSE 3000
+ENTRYPOINT ["/run.sh"]

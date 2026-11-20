@@ -31,6 +31,29 @@ def definitions():
     return sorted(os.path.basename(p)[: -len(".env")] for p in glob.glob(os.path.join(ROOT, "images", "*.env")))
 
 
+def dockerfile_of(name):
+    """The Dockerfile an image definition builds from (scripts/build.sh: DOCKERFILE, default Dockerfile)."""
+    return upstream_watch.read_env(os.path.join(ROOT, "images", f"{name}.env")).get("DOCKERFILE", "Dockerfile")
+
+
+def current_grafana_releases():
+    """Today's releases for every repository images/grafana.env watches: each at the tag the recipe pins."""
+    env = upstream_watch.read_env(os.path.join(ROOT, "images", "grafana.env"))
+    return {upstream_watch.GITHUB.match(env[f"{key}_REPO"]).group(1): [{"tag_name": env[f"{key}_TAG"]}]
+            for key in upstream_watch.watched(env)}
+
+
+class Recorder:
+    """A fetch (or read_gomod) stand-in that records its calls and answers from a dict."""
+
+    def __init__(self, answers):
+        self.answers, self.calls = answers, []
+
+    def __call__(self, *args):
+        self.calls.append(args if len(args) > 1 else args[0])
+        return self.answers[args if len(args) > 1 else args[0]]
+
+
 def stage(dockerfile, name):
     return dockerfile.split(f" AS {name}\n", 1)[1].split("\nFROM ", 1)[0]
 
@@ -123,6 +146,31 @@ RUN --network=none GOPROXY=off go build -trimpath -buildvcs=false \
  && diff /tmp/upstream-segments /tmp/segments \
  && test "$(git status --porcelain --untracked-files=all --ignored | tr '\n' ' ')" = " M go.mod  M go.sum "
 """
+
+
+class DefinitionSetsEveryBuildArgTest(unittest.TestCase):
+    # scripts/build.sh passes only the keys a definition sets, so a missing one would silently build another image.
+    SUPPLIED_BY_BUILD_SH = {"FC_COMMIT", "BUILD_DATE", "CREATED"}
+
+    def test_every_arg_without_a_default_is_set_by_the_definition(self):
+        for name in definitions():
+            env = upstream_watch.read_env(os.path.join(ROOT, "images", f"{name}.env"))
+            text = read(dockerfile_of(name)).replace("\\\n", " ")
+            declared, defaulted = set(), set()
+            for match in re.finditer(r"(?im)^\s*ARG\s+(.+)$", text):
+                for word in match.group(1).split():
+                    (defaulted if "=" in word else declared).add(word.split("=", 1)[0])
+            needed = declared - defaulted - self.SUPPLIED_BY_BUILD_SH
+            self.assertTrue(needed, name)
+            self.assertEqual(sorted(needed - set(env)), [], f"images/{name}.env does not set these ARGs")
+
+
+class StaysWordingTest(unittest.TestCase):
+    def test_the_rebuild_sentence_reads_as_plain_english(self):
+        self.assertEqual(upstream_watch.stays(["a", "b", "c"]), "The a, b and c rebuilds stay.")
+        self.assertEqual(upstream_watch.stays(["a", "b"]), "The a and b rebuilds stay.")
+        self.assertEqual(upstream_watch.stays(["a"]), "The a rebuild stays.")
+        self.assertEqual(upstream_watch.stays([]), "The images/ rebuild stays.")
 
 
 class TracesPinsTest(unittest.TestCase):
@@ -298,9 +346,12 @@ class InstructionParserTest(unittest.TestCase):
 
 
 class InventoryTest(unittest.TestCase):
-    def test_only_victoria_traces_is_rebuilt(self):
+    def test_only_victoria_traces_and_grafana_are_rebuilt(self):
         # VictoriaLogs v1.54.0 ships Go 1.27.4 and compress v1.20.4 and passes the gate: the store runs upstream's image.
-        self.assertEqual(definitions(), ["victoria-traces"])
+        self.assertEqual(definitions(), ["grafana", "victoria-traces"])
+        # This Dockerfile rebuilds only victoria-traces; grafana has its own recipe.
+        self.assertEqual([n for n in definitions() if dockerfile_of(n) == "Dockerfile"], ["victoria-traces"])
+        self.assertEqual(dockerfile_of("grafana"), "Dockerfile.grafana")
         self.assertFalse(os.path.exists(os.path.join(ROOT, "patches", "victoria-logs.patch")))
 
     def test_every_workflow_matrix_and_dockerfile_target_matches_the_definitions(self):
@@ -311,43 +362,74 @@ class InventoryTest(unittest.TestCase):
         for matrix in matrices:
             self.assertEqual(sorted(a.strip() for a in matrix.split(",")), names)
         targets = re.findall(r"(?m)^FROM runtime AS (\S+)$", read("Dockerfile"))
-        self.assertEqual(sorted(targets), names)
+        self.assertEqual(sorted(targets), [n for n in names if dockerfile_of(n) == "Dockerfile"])
+        # Every definition's target is the last stage of the Dockerfile it names, and no recipe is orphaned.
+        for name in names:
+            with self.subTest(name=name):
+                froms = [a for k, a in instructions(read(dockerfile_of(name)))[1] if k == "FROM"]
+                self.assertRegex(froms[-1], rf"(?i)\sAS\s+{re.escape(name)}$")
+        recipes = sorted(os.path.basename(p) for p in glob.glob(os.path.join(ROOT, "Dockerfile*")))
+        self.assertEqual(recipes, sorted({dockerfile_of(n) for n in names}))
 
     def test_victoria_logs_is_watched_but_never_rebuilt(self):
         # The store runs upstream's victoria-logs; a release newer than the pin must still fail the weekly watch.
         env = upstream_watch.read_env(os.path.join(ROOT, "watch", "victoria-logs.env"))
         self.assertEqual(env["UPSTREAM_TAG"], "v1.54.0")
         self.assertNotIn("victoria-logs", definitions())
-        releases = {"VictoriaMetrics/VictoriaTraces": [{"tag_name": "v0.13.0"}],
-                    "VictoriaMetrics/VictoriaLogs": [{"tag_name": "v1.55.0"}, {"tag_name": "v1.54.0"}]}
+        fetch = Recorder({"VictoriaMetrics/VictoriaTraces": [{"tag_name": "v0.13.0"}],
+                          "VictoriaMetrics/VictoriaLogs": [{"tag_name": "v1.55.0"}, {"tag_name": "v1.54.0"}],
+                          **current_grafana_releases()})
         out = io.StringIO()
         with redirect_stdout(out):
-            rc = upstream_watch.main([], fetch=releases.__getitem__)
+            rc = upstream_watch.main([], fetch=fetch, read_gomod=Recorder({}))
         self.assertEqual(rc, 1, out.getvalue())
+        # The default run watches every repository of images/ (victoria-traces, grafana and its two data sources)
+        # and of watch/ (victoria-logs).
+        self.assertEqual(sorted(fetch.calls), sorted(["VictoriaMetrics/VictoriaTraces", "VictoriaMetrics/VictoriaLogs",
+                                                      *current_grafana_releases()]))
         self.assertIn("Upstream released victoria-logs v1.55.0", out.getvalue())
-        # Archiving this repository on a victoria-logs release would drop the victoria-traces rebuild the store runs.
+        self.assertEqual(out.getvalue().count("::error"), 1, out.getvalue())
+        # Archiving this repository on a victoria-logs release would drop the rebuilds the stores run.
         self.assertIn("victoria-logs is watch-only", out.getvalue())
         self.assertIn("bump UPSTREAM_TAG in watch/victoria-logs.env", out.getvalue())
-        self.assertIn("The victoria-traces rebuild stays", out.getvalue())
+        self.assertIn("The grafana and victoria-traces rebuilds stay.", out.getvalue())
         self.assertNotIn("archive this repository", out.getvalue())
+        self.assertNotIn("Re-pin images/", out.getvalue())
 
     def test_a_rebuilt_image_with_a_newer_release_points_at_upstreams_image(self):
-        releases = {"VictoriaMetrics/VictoriaTraces": [{"tag_name": "v0.14.0"}]}
+        fetch = Recorder({"VictoriaMetrics/VictoriaTraces": [{"tag_name": "v0.14.0"}], **current_grafana_releases()})
+        read_gomod = Recorder({})
         out = io.StringIO()
         with redirect_stdout(out):
-            rc = upstream_watch.main(["--images-dir", os.path.join(ROOT, "images")], fetch=releases.__getitem__)
+            rc = upstream_watch.main(["--images-dir", os.path.join(ROOT, "images")], fetch=fetch,
+                                     read_gomod=read_gomod)
         self.assertEqual(rc, 1, out.getvalue())
         self.assertIn("victoria-traces: base v0.13.0, upstream released v0.14.0. Check its image's Go version, "
-                      "re-pin to upstream's image, and archive this repository.", out.getvalue())
+                      "re-pin to upstream's image, and archive this repository.\n", out.getvalue())
         self.assertNotIn("watch-only", out.getvalue())
+        self.assertEqual(out.getvalue().count("::error"), 1, out.getvalue())
+        # victoria-traces also sets UPSTREAM_PATCH_MODULE, but it is archived on a release, not rebuilt: grafana's
+        # drop-the-server-rebuild advice (which reads the release's go.mod) is not for it.
+        self.assertEqual(read_gomod.calls, [])
+        self.assertNotIn("server rebuild", out.getvalue())
 
     def test_the_weekly_watch_passes_against_todays_upstream_releases(self):
-        releases = {"VictoriaMetrics/VictoriaTraces": [{"tag_name": "v0.13.0"}, {"tag_name": "v0.12.1"}]}
+        fetch = Recorder({"VictoriaMetrics/VictoriaTraces": [{"tag_name": "v0.13.0"}, {"tag_name": "v0.12.1"}],
+                          "VictoriaMetrics/VictoriaLogs": [{"tag_name": "v1.54.0"}, {"tag_name": "v1.53.0"}],
+                          **current_grafana_releases()})
         out = io.StringIO()
         with redirect_stdout(out):
-            rc = upstream_watch.main(["--images-dir", os.path.join(ROOT, "images")], fetch=releases.__getitem__)
+            rc = upstream_watch.main([], fetch=fetch, read_gomod=Recorder({}))
         self.assertEqual(rc, 0, out.getvalue())
         self.assertIn("victoria-traces: base v0.13.0, newest upstream release v0.13.0: no newer release", out.getvalue())
+        self.assertIn("victoria-logs: base v1.54.0, newest upstream release v1.54.0: no newer release", out.getvalue())
+        env = upstream_watch.read_env(os.path.join(ROOT, "images", "grafana.env"))
+        for key in ("UPSTREAM", "VLOGS_DS", "JAEGER_DS"):
+            label = "grafana" if key == "UPSTREAM" else f"grafana {key}"
+            with self.subTest(key=key):
+                self.assertIn(f"{label}: base {env[key + '_TAG']}, newest upstream release {env[key + '_TAG']}: "
+                              "no newer release", out.getvalue())
+        self.assertEqual(len(out.getvalue().splitlines()), 5, out.getvalue())
 
 
 class SmokeTest(unittest.TestCase):
