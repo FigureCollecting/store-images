@@ -5,9 +5,11 @@
 # CC=x86_64-linux-gnu-gcc), same runtime image pin, same binary path and entrypoint.
 # The tag vendors its modules; the patched go.mod is built from the module cache instead (-mod=readonly),
 # filled from go.sum-verified downloads. The build fails unless the result is built by GO_VERSION, has the
-# patched module version and otherwise has exactly the build settings, module versions and ELF section names
-# of the binary in upstream's own image of the tag (UPSTREAM_IMAGE), and the tree holds no file the patch
-# added, ignored or not.
+# patched module version and otherwise has exactly the build settings, module versions, ELF section names
+# and program-header types and flags of the binary in upstream's own image of the tag (UPSTREAM_IMAGE), and
+# the tree holds no file the patch added, ignored or not. These checks and the unit tests that pin this
+# file's stages and its whole build stage catch patch drift and accidental flag changes; they are not a
+# defence against a hostile edit to this file, which is code-reviewed.
 # Build arguments come from images/<app>.env via scripts/build.sh; target = the app name.
 # Every RUN has no network, except the two that fetch the pinned source tree and its go.sum-verified modules.
 ARG GO_IMAGE=docker.io/library/golang:1.27.4@sha256:205c7636d74e0ffbe3d007162df7d74f859f5a8c8322dfb9f907977686c126cf
@@ -53,6 +55,10 @@ RUN --network=none GOPROXY=off go build -trimpath -buildvcs=false \
  && sections /tmp/upstream >/tmp/upstream-sections && sections "/out/${APP_NAME}-prod" >/tmp/sections \
  && grep -qx .symtab /tmp/upstream-sections \
  && diff /tmp/upstream-sections /tmp/sections \
+ && segments() { readelf -lW "$1" | awk '/^ +[A-Z_]+ +0x/ { f = ""; for (i = 7; i < NF; i++) f = f $i; print $1, f }'; } \
+ && segments /tmp/upstream >/tmp/upstream-segments && segments "/out/${APP_NAME}-prod" >/tmp/segments \
+ && grep -qx 'GNU_STACK RW' /tmp/upstream-segments \
+ && diff /tmp/upstream-segments /tmp/segments \
  && test "$(git status --porcelain --untracked-files=all --ignored | tr '\n' ' ')" = " M go.mod  M go.sum "
 
 FROM ${ROOT_IMAGE} AS runtime

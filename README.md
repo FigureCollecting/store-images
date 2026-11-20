@@ -39,10 +39,13 @@ UI assets match it.
   upstream's image pinned by digest. The build checks the upstream commit, the patch footprint and the Go
   version, builds from the go.sum-verified module cache with no network, and fails unless the binary's
   `go version -m` matches the binary in upstream's image except for the Go version and the moved module.
-  `-trimpath` hides the linker flags from `go version -m`, so a unit test pins the whole `go build` command
-  and the build stage's ENV and ARG lines to upstream's, and the build fails unless the binary's ELF section
-  names match upstream's (a stripped binary fails). The build also fails on any file the patch adds, at a
-  git-ignored path or not.
+  `-trimpath` hides the linker flags from `go version -m`, so the unit tests read the Dockerfile as
+  BuildKit does (keywords in any case, indentation, continuations, no parser directives, heredocs or
+  ONBUILD) and pin its sequence of FROM lines and every instruction of the build stage. The build also
+  fails unless the binary's ELF section names and its program-header types and flags match upstream's
+  binary (a stripped binary or an executable stack fails), and on any file the patch adds, at a
+  git-ignored path or not. Threat model: these checks catch patch drift and accidental flag changes; they
+  do not defend against a hostile Dockerfile edit, which code review must catch.
 - `scripts/build.sh` builds; `scripts/scan.sh` runs trivy and grype; `scripts/gate.py` fails on any
   HIGH or CRITICAL finding that has a fix, from either scanner, with no ignore list; `scripts/smoke.sh`
   runs the image, checks `/health`, writes a gzip-compressed OTLP span and reads it back through the

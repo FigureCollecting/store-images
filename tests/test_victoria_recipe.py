@@ -35,6 +35,96 @@ def stage(dockerfile, name):
     return dockerfile.split(f" AS {name}\n", 1)[1].split("\nFROM ", 1)[0]
 
 
+DIRECTIVE = re.compile(r"^#\s*([a-zA-Z][a-zA-Z0-9]*)\s*=\s*(.+?)\s*$")
+CONTINUATION = re.compile(r"\\[ \t]*$")
+
+
+def instructions(text):
+    """(parser directives, [(KEYWORD, arguments)]) as BuildKit's parser reads the text with the default escape:
+    directives only at the top; comment lines dropped, also inside a continuation (indented ones too); empty
+    continuation lines dropped; continuations joined; the first line's indentation stripped; the keyword
+    upper-cased, since Dockerfile keywords are case-insensitive. Heredocs are not parsed (a test forbids them)."""
+    lines = text.lstrip("﻿").splitlines()
+    directives = {}
+    while lines and DIRECTIVE.match(lines[0]):
+        key, value = DIRECTIVE.match(lines.pop(0)).groups()
+        directives[key.lower()] = value
+    out, current = [], None
+    for raw in lines:
+        if not raw.strip() or raw.lstrip().startswith("#"):
+            continue
+        current = raw.lstrip() if current is None else current + raw
+        if CONTINUATION.search(current):
+            current = CONTINUATION.sub("", current)
+            continue
+        out.append(split_instruction(current))
+        current = None
+    if current is not None:  # a continuation that runs into the end of the file still ends the instruction
+        out.append(split_instruction(current))
+    return directives, out
+
+
+def split_instruction(line):
+    keyword, *arguments = re.split(r"\s+", line.strip(), maxsplit=1)
+    return keyword.upper(), "".join(arguments)
+
+
+def parsed_stage(text, name):
+    """The instructions of the stage named `name` (case-insensitive, as BuildKit names stages), FROM excluded."""
+    found, ins = None, instructions(text)[1]
+    for i, (keyword, arguments) in enumerate(ins):
+        if keyword == "FROM":
+            if found is not None:
+                return ins[found:i]
+            if re.search(rf"(?i)\sAS\s+{re.escape(name)}$", arguments):
+                found = i + 1
+    return ins[found:] if found is not None else None
+
+
+# The whole build stage as reviewed: every instruction after `FROM ${GO_IMAGE} AS build`, compared after parsing,
+# so a lower-case, indented or continued spelling of an extra ENV, ARG, SHELL or RUN is still an extra instruction.
+BUILD_STAGE = r"""
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+ARG APP_NAME UPSTREAM_REPO UPSTREAM_TAG UPSTREAM_COMMIT UPSTREAM_DESCRIBE UPSTREAM_GO_VERSION \
+    UPSTREAM_PATCH_MODULE UPSTREAM_PATCH_VERSION GO_VERSION BUILD_DATE FC_REVISION
+ENV GOTOOLCHAIN=local GOFLAGS=-mod=readonly \
+    CGO_ENABLED=1 GOOS=linux GOARCH=amd64 GOAMD64=v1 CC=x86_64-linux-gnu-gcc
+WORKDIR /src
+RUN --network=none test "$(go env GOVERSION)" = "go${GO_VERSION}"
+RUN git -c advice.detachedHead=false clone --quiet --depth 1 --branch "${UPSTREAM_TAG}" "${UPSTREAM_REPO}" . \
+ && test "$(git rev-parse HEAD)" = "${UPSTREAM_COMMIT}" \
+ && h="${UPSTREAM_DESCRIBE##*-g}" \
+ && test "${UPSTREAM_DESCRIBE}" = "tags-${UPSTREAM_TAG}-0-g${h}" \
+ && test "$(git rev-parse --short="${#h}" HEAD)" = "${h}"
+COPY patches/${APP_NAME}.patch /tmp/deps.patch
+RUN --network=none git apply --check /tmp/deps.patch && git apply /tmp/deps.patch \
+ && test "$(git diff --numstat | tr '\t\n' '  ')" = "1 1 go.mod 2 2 go.sum " \
+ && grep -qxP "\t${UPSTREAM_PATCH_MODULE} ${UPSTREAM_PATCH_VERSION}" go.mod
+RUN go mod download
+COPY --from=upstream /${APP_NAME}-prod /tmp/upstream
+RUN --network=none GOPROXY=off go build -trimpath -buildvcs=false \
+      -ldflags "-extldflags '-static' -X 'github.com/VictoriaMetrics/VictoriaMetrics/lib/buildinfo.Version=${APP_NAME}-${BUILD_DATE}-${UPSTREAM_DESCRIBE}-${FC_REVISION}'" \
+      -tags 'netgo osusergo' \
+      -o "/out/${APP_NAME}-prod" "./app/${APP_NAME}" \
+ && go version -m "/out/${APP_NAME}-prod" >/tmp/buildinfo && go version -m /tmp/upstream >/tmp/upstream-buildinfo \
+ && test "$(head -n 1 /tmp/buildinfo)" = "/out/${APP_NAME}-prod: go${GO_VERSION}" \
+ && test "$(head -n 1 /tmp/upstream-buildinfo)" = "/tmp/upstream: go${UPSTREAM_GO_VERSION}" \
+ && grep -qP "^\tdep\t${UPSTREAM_PATCH_MODULE}\t${UPSTREAM_PATCH_VERSION}\t" /tmp/buildinfo \
+ && grep -cP "^\tdep\t${UPSTREAM_PATCH_MODULE}\t" /tmp/upstream-buildinfo | grep -qx 1 \
+ && norm() { tail -n +2 "$1" | grep -vP "^\tdep\t${UPSTREAM_PATCH_MODULE}\t" | cut -f1-4; } \
+ && diff <(norm /tmp/upstream-buildinfo) <(norm /tmp/buildinfo) \
+ && sections() { readelf -SW "$1" | grep -oP '^\s+\[\s*\d+\]\s\K\S+'; } \
+ && sections /tmp/upstream >/tmp/upstream-sections && sections "/out/${APP_NAME}-prod" >/tmp/sections \
+ && grep -qx .symtab /tmp/upstream-sections \
+ && diff /tmp/upstream-sections /tmp/sections \
+ && segments() { readelf -lW "$1" | awk '/^ +[A-Z_]+ +0x/ { f = ""; for (i = 7; i < NF; i++) f = f $i; print $1, f }'; } \
+ && segments /tmp/upstream >/tmp/upstream-segments && segments "/out/${APP_NAME}-prod" >/tmp/segments \
+ && grep -qx 'GNU_STACK RW' /tmp/upstream-segments \
+ && diff /tmp/upstream-segments /tmp/segments \
+ && test "$(git status --porcelain --untracked-files=all --ignored | tr '\n' ' ')" = " M go.mod  M go.sum "
+"""
+
+
 class TracesPinsTest(unittest.TestCase):
     def setUp(self):
         self.env = upstream_watch.read_env(os.path.join(ROOT, "images", "victoria-traces.env"))
@@ -104,16 +194,34 @@ class BuildGuardsTest(unittest.TestCase):
                          "${APP_NAME}-${BUILD_DATE}-${UPSTREAM_DESCRIBE}-${FC_REVISION}'\" "
                          "-tags 'netgo osusergo' -o \"/out/${APP_NAME}-prod\" \"./app/${APP_NAME}\"")
 
-    def test_the_build_stage_environment_is_exactly_the_pinned_one(self):
-        # An extra ENV (CGO_LDFLAGS=-s strips at the external link) or ARG (Docker exposes it to RUN as env)
-        # changes the binary without changing `go version -m`.
-        self.assertEqual(re.findall(r"(?m)^ENV (?:[^\n]*\\\n)*[^\n]*\n", self.build),
-                         ["ENV GOTOOLCHAIN=local GOFLAGS=-mod=readonly \\\n"
-                          "    CGO_ENABLED=1 GOOS=linux GOARCH=amd64 GOAMD64=v1 CC=x86_64-linux-gnu-gcc\n"])
-        self.assertEqual(re.findall(r"(?m)^ARG (?:[^\n]*\\\n)*[^\n]*\n", self.build),
-                         ["ARG APP_NAME UPSTREAM_REPO UPSTREAM_TAG UPSTREAM_COMMIT UPSTREAM_DESCRIBE "
-                          "UPSTREAM_GO_VERSION \\\n"
-                          "    UPSTREAM_PATCH_MODULE UPSTREAM_PATCH_VERSION GO_VERSION BUILD_DATE FC_REVISION\n"])
+    def test_the_dockerfile_has_no_parser_directive_heredoc_or_onbuild(self):
+        # The instruction pins below read the file as BuildKit does only without these: `# escape=` changes the
+        # continuation character, `# syntax=` swaps the parser, a heredoc hides lines from the instruction list,
+        # and ONBUILD runs instructions in a later stage.
+        directives, ins = instructions(self.text)
+        self.assertEqual(directives, {})
+        self.assertEqual([i for i in ins if "<<" in i[1] or i[0] == "ONBUILD"], [])
+
+    def test_the_stages_are_exactly_the_reviewed_from_sequence(self):
+        # No stage can be slipped in under `build` (a parent stage's ENV is inherited by the build).
+        self.assertEqual([a for k, a in instructions(self.text)[1] if k == "FROM"],
+                         ["${UPSTREAM_IMAGE} AS upstream", "${GO_IMAGE} AS build", "${ROOT_IMAGE} AS runtime",
+                          "runtime AS victoria-traces"])
+
+    def test_the_build_stage_is_exactly_the_reviewed_instruction_list(self):
+        # -trimpath hides -ldflags, CC and CGO_*FLAGS from `go version -m`: an extra ENV or ARG (CGO_LDFLAGS=-s
+        # strips, -Wl,-z,execstack makes the stack executable), a SHELL prefix, or a RUN `go env -w` changes the
+        # binary without changing its buildinfo, in any spelling BuildKit accepts (lower-case, indented, continued).
+        self.assertEqual(parsed_stage(self.text, "build"), instructions(BUILD_STAGE)[1])
+
+    def test_the_build_fails_unless_the_program_headers_match_upstreams_binary(self):
+        # Flags that keep the section names can still change the segments: -z execstack makes GNU_STACK RWE.
+        self.assertIn("segments() { readelf -lW \"$1\" | awk '/^ +[A-Z_]+ +0x/ { f = \"\"; "
+                      "for (i = 7; i < NF; i++) f = f $i; print $1, f }'; }", self.build)
+        self.assertIn("segments /tmp/upstream >/tmp/upstream-segments", self.build)
+        self.assertIn("segments \"/out/${APP_NAME}-prod\" >/tmp/segments", self.build)
+        self.assertIn("grep -qx 'GNU_STACK RW' /tmp/upstream-segments", self.build)
+        self.assertIn("diff /tmp/upstream-segments /tmp/segments", self.build)
 
     def test_the_build_fails_unless_the_elf_sections_match_upstreams_binary(self):
         # A stripped binary (by any spelling: -s -w, CGO_LDFLAGS=-s) lacks .symtab and the .debug_* sections.
@@ -144,6 +252,49 @@ class BuildGuardsTest(unittest.TestCase):
         for key in ("UPSTREAM_GO_VERSION", "UPSTREAM_PATCH_MODULE", "UPSTREAM_PATCH_VERSION"):
             self.assertRegex(read("scripts/build.sh"), rf"\b{key}\b")
         self.assertNotIn("UPSTREAM_GO_FIX_COMMIT", read("scripts/build.sh") + self.text)
+
+
+class InstructionParserTest(unittest.TestCase):
+    def test_keywords_are_case_insensitive_and_indentation_is_ignored(self):
+        self.assertEqual(instructions("FROM a AS build\nenv X=1\n  ENV Y=2\narg\tZ=3\n")[1],
+                         [("FROM", "a AS build"), ("ENV", "X=1"), ("ENV", "Y=2"), ("ARG", "Z=3")])
+
+    def test_continuations_join_and_skip_comment_and_empty_lines(self):
+        self.assertEqual(instructions("RUN a \\  \n  # dropped\n\n && b\n# top-level comment\nRUN c\n")[1],
+                         [("RUN", "a  && b"), ("RUN", "c")])
+
+    def test_a_continuation_at_the_end_of_the_file_ends_the_instruction(self):
+        self.assertEqual(instructions("RUN a \\\n")[1], [("RUN", "a")])
+
+    def test_parser_directives_are_read_only_at_the_top(self):
+        self.assertEqual(instructions("﻿# syntax=x/y\n# Escape = `\nFROM a\n# check=skip=all\n"),
+                         ({"syntax": "x/y", "escape": "`"}, [("FROM", "a")]))
+        self.assertEqual(instructions("# A comment\n# syntax=x/y\nFROM a\n")[0], {})
+
+    def test_a_stage_is_found_by_its_case_insensitive_name(self):
+        text = "FROM a AS gobase\nENV X=1\nfrom gobase as build\nRUN b\nFROM c AS runtime\n"
+        self.assertEqual(parsed_stage(text, "build"), [("RUN", "b")])
+        self.assertEqual(parsed_stage(text, "runtime"), [])
+        self.assertIsNone(parsed_stage(text, "missing"))
+
+    def test_every_s8_spelling_is_an_extra_build_stage_instruction(self):
+        # chal3's S8 bypasses: each passed the earlier upper-case line regexes.
+        good = read("Dockerfile")
+        exe = "CGO_LDFLAGS=-Wl,-z,execstack"
+        for name, old, new in (
+                ("lower-case env", "WORKDIR /src\n", f"WORKDIR /src\nenv {exe}\n"),
+                ("indented ENV", "WORKDIR /src\n", f"WORKDIR /src\n  ENV {exe}\n"),
+                ("lower-case arg", "WORKDIR /src\n", f"WORKDIR /src\narg {exe}\n"),
+                ("go env -w", "WORKDIR /src\n", f"WORKDIR /src\nRUN --network=none go env -w {exe}\n"),
+                ("SHELL prefix", 'SHELL ["/bin/bash"', f'SHELL ["/usr/bin/env", "{exe}", "/bin/bash"'),
+                ("continued ENV", "WORKDIR /src\n", f"WORKDIR /src\nENV \\\n  {exe}\n")):
+            with self.subTest(name=name):
+                bad = good.replace(old, new, 1)
+                self.assertNotEqual(bad, good)
+                self.assertNotEqual(parsed_stage(bad, "build"), instructions(BUILD_STAGE)[1])
+        parent = good.replace("FROM ${GO_IMAGE} AS build\n",
+                              f"FROM ${{GO_IMAGE}} AS gobase\nENV {exe}\nFROM gobase AS build\n", 1)
+        self.assertIn("gobase AS build", [a for k, a in instructions(parent)[1] if k == "FROM"])
 
 
 class InventoryTest(unittest.TestCase):
