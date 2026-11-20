@@ -19,7 +19,7 @@ app=$1 target=$2
 [ -f "$ROOT/images/$app.env" ] || { echo "no image definition images/$app.env" >&2; exit 2; }
 # shellcheck source=/dev/null
 . "$ROOT/images/$app.env"
-name="${SMOKE_NAME:-store-images-smoke-$app}"
+name="${SMOKE_NAME:-${SMOKE_PREFIX:-store-images-smoke}-$app}"
 settle="${SMOKE_SETTLE:-20}"
 work=$(mktemp -d)
 cleanup() {

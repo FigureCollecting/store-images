@@ -98,6 +98,15 @@ class ServerRebuildTest(unittest.TestCase):
                 self.assertIn(f"/tmp/{name}.apk", text.split("    rm /tmp/vlogs.zip", 1)[1].split("\n", 1)[0])
                 self.assertRegex(readme, rf"(?m)^\| {name}[^|]*\| [^|]+ \| {re.escape(version)} \|$")
 
+    def test_the_grafana_smoke_is_handed_off_and_keeps_the_smoke_prefix(self):
+        # scripts/smoke.sh execs smoke-grafana.sh before it names anything, so smoke-grafana.sh must honour
+        # SMOKE_PREFIX itself, or a prefixed run (one hold, several smokes) would collide on the default name.
+        main = read("scripts/smoke.sh")
+        handoff = main.index('[ -z "${SMOKE:-}" ] || exec "$ROOT/scripts/smoke-$SMOKE.sh" "$@"')
+        self.assertLess(handoff, main.index('name="${SMOKE_PREFIX:-store-images-smoke}-$app"'))
+        self.assertIn('name="${SMOKE_NAME:-${SMOKE_PREFIX:-store-images-smoke}-$app}"',
+                      read("scripts/smoke-grafana.sh"))
+
     def test_cloud_migration_is_off_and_the_smoke_test_asks_the_server(self):
         self.assertIn("    GF_CLOUD_MIGRATION_ENABLED=false \\\n", read("Dockerfile.grafana"))
         smoke = read("scripts/smoke-grafana.sh")

@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
 """Fail loudly when upstream has published a stable release newer than an image's base tag.
 
-For every images/*.env: list the upstream repository's GitHub releases, ignore drafts, pre-releases
-and tags that are not vX.Y.Z or vX.Y.Z+security-NN, and compare the newest with UPSTREAM_TAG. Every other
-<KEY>_REPO / <KEY>_TAG pair of the definition (a component baked into the image) is checked the same way.
+For every images/*.env (images we build) and watch/*.env (images we only watch): list the upstream
+repository's GitHub releases, ignore drafts, pre-releases and tags that are not vX.Y.Z or
+vX.Y.Z+security-NN, and compare the newest with UPSTREAM_TAG. Every other <KEY>_REPO / <KEY>_TAG pair
+of the definition (a component baked into the image) is checked the same way.
 Exit 1 if any image has a newer upstream release, 2 if a check could not be made, 0 otherwise.
-A newer release is the signal to re-pin consumers to upstream's own image and archive this repository,
-or, for a definition with WATCH_ACTION=rebuild, to re-pin the recipe and rebuild. A definition that
-rebuilds upstream's server only to move UPSTREAM_PATCH_MODULE to UPSTREAM_PATCH_VERSION is also told
-whether the newer release ships that version itself, in which case the rebuild is dropped. Opens nothing.
+For an images/ entry a newer release is the signal to re-pin consumers to upstream's own image and
+archive this repository, or, for a definition with WATCH_ACTION=rebuild, to re-pin the recipe and
+rebuild; for a watch/ entry, to re-pin the store and bump the watch tag (the images/ rebuilds stay).
+A WATCH_ACTION=rebuild definition that rebuilds upstream's server only to move UPSTREAM_PATCH_MODULE to
+UPSTREAM_PATCH_VERSION is also told whether the newer release ships that version itself, in which case
+the rebuild is dropped. Opens nothing.
 """
 import argparse
 import glob
@@ -74,8 +77,16 @@ def watched(env):
     return ["UPSTREAM"] + sorted(k[: -len("_REPO")] for k in env if k.endswith("_REPO") and k != "UPSTREAM_REPO")
 
 
-def check(name, env, fetch, key="UPSTREAM", read_gomod=None):
-    """Return (status, message) for <key>_REPO at <key>_TAG: 0 current, 1 newer upstream release, 2 cannot tell."""
+def watch_only(path):
+    """A definition under a watch/ directory: an image we only watch, never build."""
+    return os.path.basename(os.path.dirname(os.path.abspath(path))) == "watch"
+
+
+def check(name, env, fetch, key="UPSTREAM", read_gomod=None, rebuilt=None):
+    """Return (status, message) for <key>_REPO at <key>_TAG: 0 current, 1 newer upstream release, 2 cannot tell.
+
+    rebuilt is None for an image we build; for a watch-only image it names the images we build.
+    """
     label = name if key == "UPSTREAM" else f"{name} {key}"
     repo = GITHUB.match(env.get(f"{key}_REPO", ""))
     if not repo:
@@ -90,8 +101,15 @@ def check(name, env, fetch, key="UPSTREAM", read_gomod=None):
     if newest is None:
         return 2, f"{label}: no stable release found in {repo.group(1)}"
     if version(newest) > version(base):
-        step = ACTIONS[env.get("WATCH_ACTION", "archive")].format(image=name)
-        if key == "UPSTREAM" and env.get("UPSTREAM_PATCH_MODULE"):
+        action = env.get("WATCH_ACTION", "archive")
+        if rebuilt is not None:
+            step = (f"{name} is watch-only: check its image's scan, re-pin the store, then bump UPSTREAM_TAG in "
+                    f"watch/{name}.env. The {', '.join(rebuilt) or 'images/'} rebuild stays.")
+        else:
+            step = ACTIONS[action].format(image=name)
+        # Only a rebuild recipe has a server rebuild to drop; an archive-on-release image (victoria-traces also
+        # sets UPSTREAM_PATCH_MODULE) is archived whatever the release ships.
+        if rebuilt is None and action == "rebuild" and key == "UPSTREAM" and env.get("UPSTREAM_PATCH_MODULE"):
             try:
                 step += " " + server_rebuild_advice(name, env, repo.group(1), newest, read_gomod)
             except (OSError, ValueError) as exc:
@@ -123,26 +141,31 @@ def server_rebuild_advice(name, env, owner_repo, newest, read_gomod):
     return f"It still ships {module} {theirs} (ours {ours}): KEEP the server rebuild."
 
 
-def check_image(name, env, fetch, read_gomod):
+def check_image(name, env, fetch, read_gomod, rebuilt=None):
     """Return the (status, message) of every watched repository of one image definition."""
     action = env.get("WATCH_ACTION", "archive")
     if action not in ACTIONS:
         return [(2, f"{name}: WATCH_ACTION '{action}' is not {' or '.join(sorted(ACTIONS))}")]
-    return [check(name, env, fetch, key, read_gomod) for key in watched(env)]
+    return [check(name, env, fetch, key, read_gomod, rebuilt) for key in watched(env)]
 
 
 def main(argv=None, fetch=github_releases, read_gomod=None):
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--images-dir", default=os.path.join(os.path.dirname(__file__), "..", "images"))
+    here = os.path.join(os.path.dirname(__file__), "..")
+    ap.add_argument("--images-dir", action="append",
+                    help="directory of *.env definitions to check; repeatable (default: images/ and watch/)")
     args = ap.parse_args(argv)
-    paths = sorted(glob.glob(os.path.join(args.images_dir, "*.env")))
+    dirs = args.images_dir or [os.path.join(here, "images"), os.path.join(here, "watch")]
+    paths = sorted(p for d in dirs for p in glob.glob(os.path.join(d, "*.env")))
     if not paths:
-        print(f"::error title=Upstream watch failed::no image definitions in {args.images_dir}")
+        print(f"::error title=Upstream watch failed::no image definitions in {', '.join(dirs)}")
         return 2
+    rebuilt = [os.path.basename(p)[: -len(".env")] for p in paths if not watch_only(p)]
     worst = 0
     for path in paths:
         name = os.path.basename(path)[: -len(".env")]
-        for status, message in check_image(name, read_env(path), fetch, read_gomod or gomod_at):
+        for status, message in check_image(name, read_env(path), fetch, read_gomod or gomod_at,
+                                           rebuilt if watch_only(path) else None):
             print(message if status != 2 else f"::error title=Upstream watch failed::{message}")
             worst = max(worst, status)
     return worst

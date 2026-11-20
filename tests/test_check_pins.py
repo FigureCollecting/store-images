@@ -281,7 +281,18 @@ class RepositoryTest(unittest.TestCase):
         with redirect_stdout(out):
             rc = check_pins.main(["--root", ROOT])
         self.assertEqual(rc, 0, out.getvalue())
-        self.assertIn("Dockerfile.grafana:", out.getvalue())
+        # Both recipes, every stage: victoria-traces (upstream, build, runtime, target) and grafana (7 stages).
+        self.assertEqual(out.getvalue().splitlines(),
+                         ["Dockerfile: 4 FROM, pinned", "Dockerfile.grafana: 7 FROM, pinned"])
+
+    def test_unpinning_any_image_of_the_victoria_traces_recipe_is_caught(self):
+        text = self.read("Dockerfile")
+        for arg in ("UPSTREAM_IMAGE", "GO_IMAGE", "ROOT_IMAGE"):
+            with self.subTest(arg=arg):
+                unpinned, n = re.subn(rf"(?m)^(ARG {arg}=\S+?)@sha256:[0-9a-f]{{64}}$", r"\1", text)
+                self.assertEqual(n, 1)
+                got = check_pins.check_dockerfile(unpinned)
+                self.assertTrue(got and all("is not pinned by digest" in p for p in got), got)
 
     def test_the_grafana_recipe_starts_from_upstream_grafana_by_digest(self):
         text = self.read("Dockerfile.grafana")
