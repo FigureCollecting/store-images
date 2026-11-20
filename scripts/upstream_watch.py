@@ -3,8 +3,9 @@
 
 For every images/*.env (images we build) and watch/*.env (images we only watch): list the upstream repository's GitHub releases, ignore drafts, pre-releases
 and tags that are not plain vX.Y.Z, and compare the newest with UPSTREAM_TAG.
-Exit 1 if any image has a newer upstream release (the signal to re-pin consumers to upstream's own
-image and archive this repository), 2 if a check could not be made, 0 otherwise. Opens nothing.
+Exit 1 if any image has a newer upstream release, 2 if a check could not be made, 0 otherwise. For an
+images/ entry that is the signal to re-pin consumers to upstream's own image and archive this repository;
+for a watch/ entry, to re-pin the store and bump the watch tag (the images/ rebuilds stay). Opens nothing.
 """
 import argparse
 import glob
@@ -49,8 +50,16 @@ def newest_stable(releases):
     return max((t for t in tags if version(t)), key=version, default=None)
 
 
-def check(name, env, fetch):
-    """Return (status, message): status 0 current, 1 newer upstream release, 2 cannot tell."""
+def watch_only(path):
+    """A definition under a watch/ directory: an image we only watch, never build."""
+    return os.path.basename(os.path.dirname(os.path.abspath(path))) == "watch"
+
+
+def check(name, env, fetch, rebuilt=None):
+    """Return (status, message): status 0 current, 1 newer upstream release, 2 cannot tell.
+
+    rebuilt is None for an image we build; for a watch-only image it names the images we build.
+    """
     repo = GITHUB.match(env.get("UPSTREAM_REPO", ""))
     if not repo:
         return 2, f"{name}: UPSTREAM_REPO is not a github.com repository"
@@ -64,8 +73,13 @@ def check(name, env, fetch):
     if newest is None:
         return 2, f"{name}: no stable release found in {repo.group(1)}"
     if version(newest) > version(base):
+        if rebuilt is None:
+            advice = "Check its image's Go version, re-pin to upstream's image, and archive this repository."
+        else:
+            advice = (f"{name} is watch-only: check its image's scan, re-pin the store, then bump UPSTREAM_TAG in "
+                      f"watch/{name}.env. The {', '.join(rebuilt) or 'images/'} rebuild stays.")
         return 1, (f"::error title=Upstream released {name} {newest}::{name}: base {base}, upstream released "
-                   f"{newest}. Check its image's Go version, re-pin to upstream's image, and archive this repository.")
+                   f"{newest}. {advice}")
     return 0, f"{name}: base {base}, newest upstream release {newest}: no newer release"
 
 
@@ -80,10 +94,11 @@ def main(argv=None, fetch=github_releases):
     if not paths:
         print(f"::error title=Upstream watch failed::no image definitions in {', '.join(dirs)}")
         return 2
+    rebuilt = [os.path.basename(p)[: -len(".env")] for p in paths if not watch_only(p)]
     worst = 0
     for path in paths:
         name = os.path.basename(path)[: -len(".env")]
-        status, message = check(name, read_env(path), fetch)
+        status, message = check(name, read_env(path), fetch, rebuilt if watch_only(path) else None)
         print(message if status != 2 else f"::error title=Upstream watch failed::{message}")
         worst = max(worst, status)
     return worst

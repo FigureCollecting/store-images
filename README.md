@@ -39,8 +39,10 @@ UI assets match it.
   upstream's image pinned by digest. The build checks the upstream commit, the patch footprint and the Go
   version, builds from the go.sum-verified module cache with no network, and fails unless the binary's
   `go version -m` matches the binary in upstream's image except for the Go version and the moved module.
-  `-trimpath` hides the linker flags from `go version -m`, so a unit test pins the `go build` line and the CGO
-  environment to upstream's; the build also fails on any file the patch adds.
+  `-trimpath` hides the linker flags from `go version -m`, so a unit test pins the whole `go build` command
+  and the build stage's ENV and ARG lines to upstream's, and the build fails unless the binary's ELF section
+  names match upstream's (a stripped binary fails). The build also fails on any file the patch adds, at a
+  git-ignored path or not.
 - `scripts/build.sh` builds; `scripts/scan.sh` runs trivy and grype; `scripts/gate.py` fails on any
   HIGH or CRITICAL finding that has a fix, from either scanner, with no ignore list; `scripts/smoke.sh`
   runs the image, checks `/health`, writes a gzip-compressed OTLP span and reads it back through the
@@ -61,8 +63,9 @@ UI assets match it.
 - Push to `main`: the same, then publish. The image is pushed by digest with SBOM and provenance
   attestations, its linux/amd64 manifest is checked against the one that was scanned, and only then is
   it tagged. An existing tag is never overwritten; bump `FC_REVISION` to publish a new build.
-- Weekly `upstream-watch`: fails if upstream has a stable release newer than our base tag (`images/` and `watch/`). That is the
-  signal to check the new release's Go and modules, then either re-pin consumers to upstream's image and
-  archive this repo, or move the recipe to the new tag.
+- Weekly `upstream-watch`: fails if upstream has a stable release newer than our base tag (`images/` and `watch/`). For
+  an `images/` entry that is the signal to check the new release's Go and modules, then either re-pin consumers
+  to upstream's image and archive this repo, or move the recipe to the new tag. For a `watch/` entry, check its
+  image's scan, re-pin the store and bump the tag in `watch/`; the rebuilds in `images/` stay.
 
 Consumers pin by digest. The packages must be public for anonymous pulls.

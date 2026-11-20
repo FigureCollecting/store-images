@@ -91,18 +91,37 @@ class BuildGuardsTest(unittest.TestCase):
         self.assertRegex(self.build, r"(?m)^RUN go mod download$")
         self.assertIn("RUN --network=none GOPROXY=off go build ", self.build)
 
-    def test_the_go_build_line_is_upstreams_v0_13_0_linux_build(self):
+    def test_the_go_build_command_is_upstreams_v0_13_0_linux_build(self):
         # -trimpath hides -ldflags, CC and CGO_*FLAGS from `go version -m`, so only this pin sees them
         # (a stripped `-s -w` build passed every other check). Upstream's Makefile, app-via-docker, linux:
         # go build -trimpath -buildvcs=false -ldflags "-extldflags '-static' $(GO_BUILDINFO)" -tags 'netgo osusergo'
-        line = re.search(r"(?s)RUN --network=none GOPROXY=off (go build .*?) -o ", self.build).group(1)
-        self.assertEqual(re.sub(r"\s*\\\n\s*", " ", line).strip(),
+        # The pin runs through the package path: a second -ldflags after -o would win (Go uses the last one).
+        match = re.search(r"(?s)RUN --network=none GOPROXY=off (go build .*?\"\./app/\$\{APP_NAME\}\")", self.build)
+        self.assertIsNotNone(match, "no offline go build of ./app/${APP_NAME} in the build stage")
+        self.assertEqual(re.sub(r"\s*\\\n\s*", " ", match.group(1)).strip(),
                          "go build -trimpath -buildvcs=false "
                          "-ldflags \"-extldflags '-static' -X 'github.com/VictoriaMetrics/VictoriaMetrics/lib/buildinfo.Version="
                          "${APP_NAME}-${BUILD_DATE}-${UPSTREAM_DESCRIBE}-${FC_REVISION}'\" "
-                         "-tags 'netgo osusergo'")
-        self.assertIn("ENV GOTOOLCHAIN=local GOFLAGS=-mod=readonly \\\n"
-                      "    CGO_ENABLED=1 GOOS=linux GOARCH=amd64 GOAMD64=v1 CC=x86_64-linux-gnu-gcc", self.build)
+                         "-tags 'netgo osusergo' -o \"/out/${APP_NAME}-prod\" \"./app/${APP_NAME}\"")
+
+    def test_the_build_stage_environment_is_exactly_the_pinned_one(self):
+        # An extra ENV (CGO_LDFLAGS=-s strips at the external link) or ARG (Docker exposes it to RUN as env)
+        # changes the binary without changing `go version -m`.
+        self.assertEqual(re.findall(r"(?m)^ENV (?:[^\n]*\\\n)*[^\n]*\n", self.build),
+                         ["ENV GOTOOLCHAIN=local GOFLAGS=-mod=readonly \\\n"
+                          "    CGO_ENABLED=1 GOOS=linux GOARCH=amd64 GOAMD64=v1 CC=x86_64-linux-gnu-gcc\n"])
+        self.assertEqual(re.findall(r"(?m)^ARG (?:[^\n]*\\\n)*[^\n]*\n", self.build),
+                         ["ARG APP_NAME UPSTREAM_REPO UPSTREAM_TAG UPSTREAM_COMMIT UPSTREAM_DESCRIBE "
+                          "UPSTREAM_GO_VERSION \\\n"
+                          "    UPSTREAM_PATCH_MODULE UPSTREAM_PATCH_VERSION GO_VERSION BUILD_DATE FC_REVISION\n"])
+
+    def test_the_build_fails_unless_the_elf_sections_match_upstreams_binary(self):
+        # A stripped binary (by any spelling: -s -w, CGO_LDFLAGS=-s) lacks .symtab and the .debug_* sections.
+        self.assertIn("sections() { readelf -SW \"$1\" | grep -oP '^\\s+\\[\\s*\\d+\\]\\s\\K\\S+'; }", self.build)
+        self.assertIn("sections /tmp/upstream >/tmp/upstream-sections", self.build)
+        self.assertIn("sections \"/out/${APP_NAME}-prod\" >/tmp/sections", self.build)
+        self.assertIn("grep -qx .symtab /tmp/upstream-sections", self.build)
+        self.assertIn("diff /tmp/upstream-sections /tmp/sections", self.build)
 
     def test_the_binary_differs_from_upstream_only_in_go_and_the_patched_module(self):
         self.assertIn("COPY --from=upstream /${APP_NAME}-prod /tmp/upstream", self.build)
@@ -111,7 +130,9 @@ class BuildGuardsTest(unittest.TestCase):
                       'grep -qP "^\\tdep\\t${UPSTREAM_PATCH_MODULE}\\t${UPSTREAM_PATCH_VERSION}\\t" /tmp/buildinfo',
                       'grep -cP "^\\tdep\\t${UPSTREAM_PATCH_MODULE}\\t" /tmp/upstream-buildinfo | grep -qx 1',
                       "diff <(norm /tmp/upstream-buildinfo) <(norm /tmp/buildinfo)",
-                      'test "$(git status --porcelain --untracked-files=all | tr \'\\n\' \' \')" = " M go.mod  M go.sum "'):
+                      # --ignored: a patch-added file at a git-ignored path (*.tmp in the embedded UI) is listed too
+                      'test "$(git status --porcelain --untracked-files=all --ignored | tr \'\\n\' \' \')" = '
+                      '" M go.mod  M go.sum "'):
             with self.subTest(guard=guard):
                 self.assertIn(guard, self.build)
 
@@ -153,6 +174,21 @@ class InventoryTest(unittest.TestCase):
             rc = upstream_watch.main([], fetch=releases.__getitem__)
         self.assertEqual(rc, 1, out.getvalue())
         self.assertIn("Upstream released victoria-logs v1.55.0", out.getvalue())
+        # Archiving this repository on a victoria-logs release would drop the victoria-traces rebuild the store runs.
+        self.assertIn("victoria-logs is watch-only", out.getvalue())
+        self.assertIn("bump UPSTREAM_TAG in watch/victoria-logs.env", out.getvalue())
+        self.assertIn("The victoria-traces rebuild stays", out.getvalue())
+        self.assertNotIn("archive this repository", out.getvalue())
+
+    def test_a_rebuilt_image_with_a_newer_release_points_at_upstreams_image(self):
+        releases = {"VictoriaMetrics/VictoriaTraces": [{"tag_name": "v0.14.0"}]}
+        out = io.StringIO()
+        with redirect_stdout(out):
+            rc = upstream_watch.main(["--images-dir", os.path.join(ROOT, "images")], fetch=releases.__getitem__)
+        self.assertEqual(rc, 1, out.getvalue())
+        self.assertIn("victoria-traces: base v0.13.0, upstream released v0.14.0. Check its image's Go version, "
+                      "re-pin to upstream's image, and archive this repository.", out.getvalue())
+        self.assertNotIn("watch-only", out.getvalue())
 
     def test_the_weekly_watch_passes_against_todays_upstream_releases(self):
         releases = {"VictoriaMetrics/VictoriaTraces": [{"tag_name": "v0.13.0"}, {"tag_name": "v0.12.1"}]}

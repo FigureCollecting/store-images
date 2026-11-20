@@ -5,8 +5,9 @@
 # CC=x86_64-linux-gnu-gcc), same runtime image pin, same binary path and entrypoint.
 # The tag vendors its modules; the patched go.mod is built from the module cache instead (-mod=readonly),
 # filled from go.sum-verified downloads. The build fails unless the result is built by GO_VERSION, has the
-# patched module version and otherwise has exactly the build settings and module versions of the binary in
-# upstream's own image of the tag (UPSTREAM_IMAGE).
+# patched module version and otherwise has exactly the build settings, module versions and ELF section names
+# of the binary in upstream's own image of the tag (UPSTREAM_IMAGE), and the tree holds no file the patch
+# added, ignored or not.
 # Build arguments come from images/<app>.env via scripts/build.sh; target = the app name.
 # Every RUN has no network, except the two that fetch the pinned source tree and its go.sum-verified modules.
 ARG GO_IMAGE=docker.io/library/golang:1.27.4@sha256:205c7636d74e0ffbe3d007162df7d74f859f5a8c8322dfb9f907977686c126cf
@@ -48,7 +49,11 @@ RUN --network=none GOPROXY=off go build -trimpath -buildvcs=false \
  && grep -cP "^\tdep\t${UPSTREAM_PATCH_MODULE}\t" /tmp/upstream-buildinfo | grep -qx 1 \
  && norm() { tail -n +2 "$1" | grep -vP "^\tdep\t${UPSTREAM_PATCH_MODULE}\t" | cut -f1-4; } \
  && diff <(norm /tmp/upstream-buildinfo) <(norm /tmp/buildinfo) \
- && test "$(git status --porcelain --untracked-files=all | tr '\n' ' ')" = " M go.mod  M go.sum "
+ && sections() { readelf -SW "$1" | grep -oP '^\s+\[\s*\d+\]\s\K\S+'; } \
+ && sections /tmp/upstream >/tmp/upstream-sections && sections "/out/${APP_NAME}-prod" >/tmp/sections \
+ && grep -qx .symtab /tmp/upstream-sections \
+ && diff /tmp/upstream-sections /tmp/sections \
+ && test "$(git status --porcelain --untracked-files=all --ignored | tr '\n' ' ')" = " M go.mod  M go.sum "
 
 FROM ${ROOT_IMAGE} AS runtime
 ARG ROOT_IMAGE APP_NAME UPSTREAM_REPO UPSTREAM_TAG UPSTREAM_COMMIT UPSTREAM_GO_VERSION UPSTREAM_PATCH_MODULE \
