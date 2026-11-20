@@ -48,7 +48,7 @@ RUN --network=none GOPROXY=off go build -trimpath -buildvcs=false \
  && grep -cP "^\tdep\t${UPSTREAM_PATCH_MODULE}\t" /tmp/upstream-buildinfo | grep -qx 1 \
  && norm() { tail -n +2 "$1" | grep -vP "^\tdep\t${UPSTREAM_PATCH_MODULE}\t" | cut -f1-4; } \
  && diff <(norm /tmp/upstream-buildinfo) <(norm /tmp/buildinfo) \
- && test "$(git status --porcelain --untracked-files=no | tr '\n' ' ')" = " M go.mod  M go.sum "
+ && test "$(git status --porcelain --untracked-files=all | tr '\n' ' ')" = " M go.mod  M go.sum "
 
 FROM ${ROOT_IMAGE} AS runtime
 ARG ROOT_IMAGE APP_NAME UPSTREAM_REPO UPSTREAM_TAG UPSTREAM_COMMIT UPSTREAM_GO_VERSION UPSTREAM_PATCH_MODULE \

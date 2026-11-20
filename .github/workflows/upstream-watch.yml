@@ -1,7 +1,8 @@
 name: upstream-watch
 
-# Weekly: fail loudly if VictoriaTraces has published a stable release newer than the tag we rebuild. That is the signal to re-pin consumers to upstream's own image and archive
-# this repository. Opens nothing, writes nothing.
+# Weekly: fail loudly if upstream has published a stable release newer than the tag in images/*.env (VictoriaTraces,
+# rebuilt here) or watch/*.env (VictoriaLogs, watched only). That is the signal to check the release, then re-pin
+# consumers to upstream's own image and archive this repository. Opens nothing, writes nothing.
 on:
   schedule:
     - cron: "17 13 * * 1"

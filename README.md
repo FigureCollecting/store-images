@@ -21,17 +21,26 @@ VictoriaLogs v1.54.0 ships.
 VictoriaLogs is no longer rebuilt here. Upstream's v1.54.0 image is built with Go 1.27.4 and
 klauspost/compress v1.20.4 and passed the scan gate on 2026-11-20, so consumers pin upstream's image.
 The last recipe (v1.53.0-fc1) is in this repository's history; the published package stays.
+`watch/victoria-logs.env` keeps it on the weekly upstream-watch (no build), so a newer upstream release is
+still flagged.
+
+The binary is built from the clean tag. Upstream's own v0.13.0 binary reports a `-dirty` version suffix
+(its release was built from a modified tree); `-help`, the image config, the Go buildinfo and the embedded
+UI assets match it.
 
 ## Layout
 
 - `images/<app>.env`: the definition (upstream repo, tag, commit and image, upstream's Go, our Go, the
   module and version the patch moves, our `FC_REVISION`).
+- `watch/<app>.env`: an image we only watch (upstream repo and the tag the store runs); never built.
 - `patches/<app>.patch`: the only source change, the module's line in `go.mod` and its two `go.sum` lines.
 - `Dockerfile`: upstream's linux/amd64 build (`-trimpath`, static, `netgo osusergo`, CGO on as upstream
   does for amd64, same distroless runtime pin, same binary path), with the builder, the runtime and
   upstream's image pinned by digest. The build checks the upstream commit, the patch footprint and the Go
   version, builds from the go.sum-verified module cache with no network, and fails unless the binary's
   `go version -m` matches the binary in upstream's image except for the Go version and the moved module.
+  `-trimpath` hides the linker flags from `go version -m`, so a unit test pins the `go build` line and the CGO
+  environment to upstream's; the build also fails on any file the patch adds.
 - `scripts/build.sh` builds; `scripts/scan.sh` runs trivy and grype; `scripts/gate.py` fails on any
   HIGH or CRITICAL finding that has a fix, from either scanner, with no ignore list; `scripts/smoke.sh`
   runs the image, checks `/health`, writes a gzip-compressed OTLP span and reads it back through the
@@ -52,7 +61,7 @@ The last recipe (v1.53.0-fc1) is in this repository's history; the published pac
 - Push to `main`: the same, then publish. The image is pushed by digest with SBOM and provenance
   attestations, its linux/amd64 manifest is checked against the one that was scanned, and only then is
   it tagged. An existing tag is never overwritten; bump `FC_REVISION` to publish a new build.
-- Weekly `upstream-watch`: fails if upstream has a stable release newer than our base tag. That is the
+- Weekly `upstream-watch`: fails if upstream has a stable release newer than our base tag (`images/` and `watch/`). That is the
   signal to check the new release's Go and modules, then either re-pin consumers to upstream's image and
   archive this repo, or move the recipe to the new tag.
 

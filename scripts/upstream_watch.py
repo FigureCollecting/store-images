@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Fail loudly when upstream has published a stable release newer than an image's base tag.
 
-For every images/*.env: list the upstream repository's GitHub releases, ignore drafts, pre-releases
+For every images/*.env (images we build) and watch/*.env (images we only watch): list the upstream repository's GitHub releases, ignore drafts, pre-releases
 and tags that are not plain vX.Y.Z, and compare the newest with UPSTREAM_TAG.
 Exit 1 if any image has a newer upstream release (the signal to re-pin consumers to upstream's own
 image and archive this repository), 2 if a check could not be made, 0 otherwise. Opens nothing.
@@ -71,11 +71,14 @@ def check(name, env, fetch):
 
 def main(argv=None, fetch=github_releases):
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--images-dir", default=os.path.join(os.path.dirname(__file__), "..", "images"))
+    here = os.path.join(os.path.dirname(__file__), "..")
+    ap.add_argument("--images-dir", action="append",
+                    help="directory of *.env definitions to check; repeatable (default: images/ and watch/)")
     args = ap.parse_args(argv)
-    paths = sorted(glob.glob(os.path.join(args.images_dir, "*.env")))
+    dirs = args.images_dir or [os.path.join(here, "images"), os.path.join(here, "watch")]
+    paths = sorted(p for d in dirs for p in glob.glob(os.path.join(d, "*.env")))
     if not paths:
-        print(f"::error title=Upstream watch failed::no image definitions in {args.images_dir}")
+        print(f"::error title=Upstream watch failed::no image definitions in {', '.join(dirs)}")
         return 2
     worst = 0
     for path in paths:

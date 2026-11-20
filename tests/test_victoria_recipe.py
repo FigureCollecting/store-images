@@ -91,6 +91,19 @@ class BuildGuardsTest(unittest.TestCase):
         self.assertRegex(self.build, r"(?m)^RUN go mod download$")
         self.assertIn("RUN --network=none GOPROXY=off go build ", self.build)
 
+    def test_the_go_build_line_is_upstreams_v0_13_0_linux_build(self):
+        # -trimpath hides -ldflags, CC and CGO_*FLAGS from `go version -m`, so only this pin sees them
+        # (a stripped `-s -w` build passed every other check). Upstream's Makefile, app-via-docker, linux:
+        # go build -trimpath -buildvcs=false -ldflags "-extldflags '-static' $(GO_BUILDINFO)" -tags 'netgo osusergo'
+        line = re.search(r"(?s)RUN --network=none GOPROXY=off (go build .*?) -o ", self.build).group(1)
+        self.assertEqual(re.sub(r"\s*\\\n\s*", " ", line).strip(),
+                         "go build -trimpath -buildvcs=false "
+                         "-ldflags \"-extldflags '-static' -X 'github.com/VictoriaMetrics/VictoriaMetrics/lib/buildinfo.Version="
+                         "${APP_NAME}-${BUILD_DATE}-${UPSTREAM_DESCRIBE}-${FC_REVISION}'\" "
+                         "-tags 'netgo osusergo'")
+        self.assertIn("ENV GOTOOLCHAIN=local GOFLAGS=-mod=readonly \\\n"
+                      "    CGO_ENABLED=1 GOOS=linux GOARCH=amd64 GOAMD64=v1 CC=x86_64-linux-gnu-gcc", self.build)
+
     def test_the_binary_differs_from_upstream_only_in_go_and_the_patched_module(self):
         self.assertIn("COPY --from=upstream /${APP_NAME}-prod /tmp/upstream", self.build)
         for guard in ('test "$(head -n 1 /tmp/buildinfo)" = "/out/${APP_NAME}-prod: go${GO_VERSION}"',
@@ -98,7 +111,7 @@ class BuildGuardsTest(unittest.TestCase):
                       'grep -qP "^\\tdep\\t${UPSTREAM_PATCH_MODULE}\\t${UPSTREAM_PATCH_VERSION}\\t" /tmp/buildinfo',
                       'grep -cP "^\\tdep\\t${UPSTREAM_PATCH_MODULE}\\t" /tmp/upstream-buildinfo | grep -qx 1',
                       "diff <(norm /tmp/upstream-buildinfo) <(norm /tmp/buildinfo)",
-                      'test "$(git status --porcelain --untracked-files=no | tr \'\\n\' \' \')" = " M go.mod  M go.sum "'):
+                      'test "$(git status --porcelain --untracked-files=all | tr \'\\n\' \' \')" = " M go.mod  M go.sum "'):
             with self.subTest(guard=guard):
                 self.assertIn(guard, self.build)
 
@@ -127,6 +140,19 @@ class InventoryTest(unittest.TestCase):
             self.assertEqual(sorted(a.strip() for a in matrix.split(",")), names)
         targets = re.findall(r"(?m)^FROM runtime AS (\S+)$", read("Dockerfile"))
         self.assertEqual(sorted(targets), names)
+
+    def test_victoria_logs_is_watched_but_never_rebuilt(self):
+        # The store runs upstream's victoria-logs; a release newer than the pin must still fail the weekly watch.
+        env = upstream_watch.read_env(os.path.join(ROOT, "watch", "victoria-logs.env"))
+        self.assertEqual(env["UPSTREAM_TAG"], "v1.54.0")
+        self.assertNotIn("victoria-logs", definitions())
+        releases = {"VictoriaMetrics/VictoriaTraces": [{"tag_name": "v0.13.0"}],
+                    "VictoriaMetrics/VictoriaLogs": [{"tag_name": "v1.55.0"}, {"tag_name": "v1.54.0"}]}
+        out = io.StringIO()
+        with redirect_stdout(out):
+            rc = upstream_watch.main([], fetch=releases.__getitem__)
+        self.assertEqual(rc, 1, out.getvalue())
+        self.assertIn("Upstream released victoria-logs v1.55.0", out.getvalue())
 
     def test_the_weekly_watch_passes_against_todays_upstream_releases(self):
         releases = {"VictoriaMetrics/VictoriaTraces": [{"tag_name": "v0.13.0"}, {"tag_name": "v0.12.1"}]}
