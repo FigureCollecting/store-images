@@ -42,7 +42,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        app: [victoria-traces, grafana]
+        app: [victoria-traces, grafana, tailscale]
     env:
       APP: ${{ matrix.app }}
     steps:
@@ -70,7 +70,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        app: [victoria-traces, grafana]
+        app: [victoria-traces, grafana, tailscale]
     env:
       APP: ${{ matrix.app }}
     steps:

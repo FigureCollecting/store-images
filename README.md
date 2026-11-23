@@ -12,6 +12,9 @@ and it holds no other image we use. At that point, consumers pin upstream's own 
 It also holds the recipe for our Grafana image, `ghcr.io/figurecollecting/grafana` (see
 [Grafana](#grafana)). The recipe is public; the image is internal today; see [CI](#ci), last paragraph.
 
+A third recipe rebuilds Tailscale's container image, `ghcr.io/figurecollecting/tailscale` (see
+[Tailscale](#tailscale)), until an upstream release passes the scan gate.
+
 ## What is rebuilt
 
 | Image | Upstream tag (commit) | Upstream Go | Ours | Module moved | Fixes |
@@ -170,6 +173,65 @@ Known limits:
 - The Prometheus, Loki, Tempo and other bundled data sources are absent. Grafana logs two errors at
   start about the missing Prometheus plugin.
 
+## Tailscale
+
+`Dockerfile.tailscale` starts from upstream's `tailscale/tailscale` image of a release tag, pinned by
+digest, and changes three things. The image is published as
+`ghcr.io/figurecollecting/tailscale:v1.104.7-fc1`.
+
+| Component | Upstream v1.104.7 (cbc74fe48e) | Ours | Fixes |
+|---|---|---|---|
+| `golang.org/x/net` in `tailscale`, `tailscaled`, `containerboot` | v0.60.0 | `golang.org/x/net` v0.62.0 (upstream d064d751 on main) | CVE-2026-78661 |
+| `github.com/klauspost/compress` in `tailscale`, `tailscaled` | v1.20.0 | `github.com/klauspost/compress` v1.20.2 (upstream 46f93879 on main) | CVE-2026-116591 |
+| zlib (Alpine 3.22) | 1.3.2-r1 | zlib 1.4-r0 (a pinned, sha256-verified file) | CVE-2026-4738 |
+
+Upstream's v1.104.7 image fails the scan gate on these three (checked 2026-11-23: trivy reports the
+first, grype the other two). Both module versions are the ones upstream's own v1.106.0 tag ships;
+`release-branch/1.104` had neither on that day.
+
+The three binaries are built from the clean tag plus `patches/tailscale.patch` (the two module lines in
+`go.mod` and their `go.sum` lines) with upstream's toolchain, Tailscale's fork of Go at the revision
+the tag's `go.toolchain.rev` names (a pinned, sha256-verified download), and with the build tags, CGO
+setting, `-trimpath` and version stamps of upstream's container build. Built this way without the
+patch, the three binaries are byte-identical to the ones in upstream's image (checked 2026-11-23). The
+build fails unless each patched binary differs from upstream's only in the two modules and in the two
+marks Go puts on a build from a changed tree: `go version -m` reports the module as `v1.104.7+dirty`
+and `vcs.modified=true`, because `go.mod` and `go.sum` are changed.
+
+Everything else is upstream's: the Alpine base and its other packages, the iptables links, the command
+(`/usr/local/bin/containerboot`), no entrypoint and no user. Like upstream's image it runs as root
+unless the deployment sets a user, so a deployment written for upstream's image needs only the image
+line changed. The version stamps are upstream's too: the short and long versions are v1.104.7's
+(`1.104.7-tcbc74fe48`), and `tailscale version` prints upstream's commit with `-dirty` appended, which
+Tailscale adds by itself to a build from a changed tree. That mark, the label set and `go version -m` on
+a binary tell the two images apart. The whole file system is one layer, so the replaced binaries and the
+old zlib are in no layer.
+
+The smoke test gives no container a network or a key, so it joins no tailnet. It compares the image
+with upstream's (config, version output, and every path of the file system), reads the three
+binaries' build information, and starts `containerboot` as our deployments run it (uid 10001,
+read-only root, no capabilities, userspace networking) until `tailscale status` answers `NeedsLogin`.
+It does not exercise a tunnel, the outbound proxy or `tailscale serve`; those need a tailnet.
+
+Delete the recipe when an upstream release passes the gate: the weekly `upstream-watch` fails on a
+newer stable release and asks for `scripts/scan.sh` on upstream's image of it. If it passes, re-pin
+consumers to upstream's image and delete `images/tailscale.env`, `Dockerfile.tailscale`,
+`patches/tailscale.patch` and `scripts/smoke-tailscale.sh`. Upstream tagged v1.106.0, with both module
+changes, on 2026-11-23; its image was not published yet when this recipe was written.
+
+Known limits:
+
+- The zlib pin is a file on Alpine's CDN, which keeps only the current package version. When Alpine
+  supersedes 1.4-r0 in v3.22 the URL returns 404 and the build fails until it is re-pinned.
+- `apk add` of the file records the package in `/etc/apk/world`, pinned to that file's checksum. A
+  later `apk upgrade` inside the image, which nothing here runs, would refuse to move zlib.
+- The Tailscale toolchain is a release asset of `github.com/tailscale/go`, verified by checksum only.
+- OpenSSL stays upstream's (`libcrypto3` and `libssl3` 3.5.9-r0). Alpine's security database names
+  3.5.9-r1 as the fix for five CVEs in v3.22, but v3.22 had not published that package on 2026-11-23
+  and neither scanner reported a fix yet. When they do, the gate fails for this image and for
+  upstream's; pin the two packages then, as `Dockerfile.grafana` does. The Tailscale binaries are
+  static Go and do not load OpenSSL.
+
 ## Layout
 
 - `images/<app>.env`: the definition (upstream repo, tag, commit and image, upstream's Go, our Go, the
@@ -195,7 +257,9 @@ Known limits:
   runs the image, checks `/health`, writes a gzip-compressed OTLP span and reads it back through the
   Jaeger API, and checks the version string and `go version -m`;
   `scripts/smoke-grafana.sh` runs Grafana with no network and checks health, the plugins, the defaults
-  and that nothing tried to reach the outside; `scripts/check_pins.py` fails on a base image without a
+  and that nothing tried to reach the outside; `scripts/smoke-tailscale.sh` runs Tailscale with no
+  network and compares it with upstream's image, using `scripts/rootfs_diff.py` to name every path
+  that differs between the two file systems; `scripts/check_pins.py` fails on a base image without a
   digest or a download without a checksum; `scripts/upstream_watch.py` reports a newer upstream release.
 
 ## Local use
@@ -218,6 +282,8 @@ Known limits:
   to upstream's image and archive this repo, or move the recipe to the new tag. For a `watch/` entry, check its
   image's scan, re-pin the store and bump the tag in `watch/`; the rebuilds in `images/` stay.
   For Grafana it also watches the two data sources, and a newer release means re-pin and rebuild.
+  For Tailscale a newer release means scan upstream's image and, if it passes, delete the recipe.
 
-Consumers pin by digest. Both packages are internal today; the cluster can pull them only
+Consumers pin by digest. The victoria-traces and grafana packages are internal today; the cluster can pull them only
 after they are made public or a pull secret is added, which is decided before either image is deployed.
+The tailscale package is created by its first publish from `main` and needs the same decision.

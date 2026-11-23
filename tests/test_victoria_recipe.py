@@ -37,10 +37,14 @@ def dockerfile_of(name):
 
 
 def current_grafana_releases():
-    """Today's releases for every repository images/grafana.env watches: each at the tag the recipe pins."""
-    env = upstream_watch.read_env(os.path.join(ROOT, "images", "grafana.env"))
-    return {upstream_watch.GITHUB.match(env[f"{key}_REPO"]).group(1): [{"tag_name": env[f"{key}_TAG"]}]
-            for key in upstream_watch.watched(env)}
+    """Today's releases for every repository images/grafana.env and images/tailscale.env watch: each at the tag
+    its recipe pins."""
+    releases = {}
+    for name in ("grafana", "tailscale"):
+        env = upstream_watch.read_env(os.path.join(ROOT, "images", f"{name}.env"))
+        releases.update({upstream_watch.GITHUB.match(env[f"{key}_REPO"]).group(1): [{"tag_name": env[f"{key}_TAG"]}]
+                         for key in upstream_watch.watched(env)})
+    return releases
 
 
 class Recorder:
@@ -346,12 +350,13 @@ class InstructionParserTest(unittest.TestCase):
 
 
 class InventoryTest(unittest.TestCase):
-    def test_only_victoria_traces_and_grafana_are_rebuilt(self):
+    def test_only_victoria_traces_grafana_and_tailscale_are_rebuilt(self):
         # VictoriaLogs v1.54.0 ships Go 1.27.4 and compress v1.20.4 and passes the gate: the store runs upstream's image.
-        self.assertEqual(definitions(), ["grafana", "victoria-traces"])
-        # This Dockerfile rebuilds only victoria-traces; grafana has its own recipe.
+        self.assertEqual(definitions(), ["grafana", "tailscale", "victoria-traces"])
+        # This Dockerfile rebuilds only victoria-traces; grafana and tailscale have their own recipes.
         self.assertEqual([n for n in definitions() if dockerfile_of(n) == "Dockerfile"], ["victoria-traces"])
         self.assertEqual(dockerfile_of("grafana"), "Dockerfile.grafana")
+        self.assertEqual(dockerfile_of("tailscale"), "Dockerfile.tailscale")
         self.assertFalse(os.path.exists(os.path.join(ROOT, "patches", "victoria-logs.patch")))
 
     def test_every_workflow_matrix_and_dockerfile_target_matches_the_definitions(self):
@@ -392,7 +397,7 @@ class InventoryTest(unittest.TestCase):
         # Archiving this repository on a victoria-logs release would drop the rebuilds the stores run.
         self.assertIn("victoria-logs is watch-only", out.getvalue())
         self.assertIn("bump UPSTREAM_TAG in watch/victoria-logs.env", out.getvalue())
-        self.assertIn("The grafana and victoria-traces rebuilds stay.", out.getvalue())
+        self.assertIn("The grafana, tailscale and victoria-traces rebuilds stay.", out.getvalue())
         self.assertNotIn("archive this repository", out.getvalue())
         self.assertNotIn("Re-pin images/", out.getvalue())
 
@@ -429,7 +434,10 @@ class InventoryTest(unittest.TestCase):
             with self.subTest(key=key):
                 self.assertIn(f"{label}: base {env[key + '_TAG']}, newest upstream release {env[key + '_TAG']}: "
                               "no newer release", out.getvalue())
-        self.assertEqual(len(out.getvalue().splitlines()), 5, out.getvalue())
+        tailscale = upstream_watch.read_env(os.path.join(ROOT, "images", "tailscale.env"))["UPSTREAM_TAG"]
+        self.assertIn(f"tailscale: base {tailscale}, newest upstream release {tailscale}: no newer release",
+                      out.getvalue())
+        self.assertEqual(len(out.getvalue().splitlines()), 6, out.getvalue())
 
 
 class SmokeTest(unittest.TestCase):
