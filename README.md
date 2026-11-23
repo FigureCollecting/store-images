@@ -226,6 +226,11 @@ Known limits:
 - `apk add` of the file records the package in `/etc/apk/world`, pinned to that file's checksum. A
   later `apk upgrade` inside the image, which nothing here runs, would refuse to move zlib.
 - The Tailscale toolchain is a release asset of `github.com/tailscale/go`, verified by checksum only.
+- OpenSSL stays upstream's (`libcrypto3` and `libssl3` 3.5.9-r0). Alpine's security database names
+  3.5.9-r1 as the fix for five CVEs in v3.22, but v3.22 had not published that package on 2026-11-23
+  and neither scanner reported a fix yet. When they do, the gate fails for this image and for
+  upstream's; pin the two packages then, as `Dockerfile.grafana` does. The Tailscale binaries are
+  static Go and do not load OpenSSL.
 
 ## Layout
 
