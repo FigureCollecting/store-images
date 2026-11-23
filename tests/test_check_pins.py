@@ -281,9 +281,27 @@ class RepositoryTest(unittest.TestCase):
         with redirect_stdout(out):
             rc = check_pins.main(["--root", ROOT])
         self.assertEqual(rc, 0, out.getvalue())
-        # Both recipes, every stage: victoria-traces (upstream, build, runtime, target) and grafana (7 stages).
+        # Every recipe, every stage: victoria-traces (upstream, build, runtime, target), grafana (7 stages) and
+        # tailscale (upstream, build, rootfs, target).
         self.assertEqual(out.getvalue().splitlines(),
-                         ["Dockerfile: 4 FROM, pinned", "Dockerfile.grafana: 7 FROM, pinned"])
+                         ["Dockerfile: 4 FROM, pinned", "Dockerfile.grafana: 7 FROM, pinned",
+                          "Dockerfile.tailscale: 4 FROM, pinned"])
+
+    def test_unpinning_any_image_or_download_of_the_tailscale_recipe_is_caught(self):
+        text = self.read("Dockerfile.tailscale")
+        for arg in ("UPSTREAM_IMAGE", "GO_IMAGE"):
+            with self.subTest(arg=arg):
+                unpinned, n = re.subn(rf"(?m)^(ARG {arg}=\S+?)@sha256:[0-9a-f]{{64}}$", r"\1", text)
+                self.assertEqual(n, 1)
+                got = check_pins.check_dockerfile(unpinned)
+                self.assertTrue(got and all("is not pinned by digest" in p for p in got), got)
+        # The toolchain and the zlib package are downloads: each ADD carries its checksum.
+        for arg in ("TS_GO", "ZLIB"):
+            with self.subTest(arg=arg):
+                unpinned, n = re.subn(rf"ADD --checksum=\$\{{{arg}_SHA256\}} ", "ADD ", text)
+                self.assertEqual(n, 1)
+                got = check_pins.check_dockerfile(unpinned)
+                self.assertTrue(got and all("has no --checksum=sha256:<64 hex>" in p for p in got), got)
 
     def test_unpinning_any_image_of_the_victoria_traces_recipe_is_caught(self):
         text = self.read("Dockerfile")

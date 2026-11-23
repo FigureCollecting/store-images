@@ -1,0 +1,130 @@
+# Tailscale: upstream's image of the release tag, pinned by digest, with
+#   - its three binaries (tailscale, tailscaled, containerboot) rebuilt from the tag with two modules moved to
+#     fixed versions (patches/tailscale.patch: golang.org/x/net and github.com/klauspost/compress, go.mod and
+#     go.sum only), using upstream's toolchain (Tailscale's fork of Go at the revision the tag's
+#     go.toolchain.rev names), upstream's build tags, CGO off, -trimpath and upstream's version stamps
+#     (the tools report upstream's version, and upstream's commit with -dirty appended);
+#   - Alpine's zlib moved to the fixed package (a pinned file, sha256-verified).
+# Everything else is upstream's files and settings: the same command, no entrypoint, no user (a deployment sets
+# one, as it does for upstream's image). The whole file system is one layer, so the replaced binaries and the
+# old zlib are in no layer (a second layer, from WORKDIR, is empty).
+# The build fails unless each binary is built by the same Go, has the two modules at the pinned versions and
+# otherwise has exactly the build settings, module versions and hashes, ELF section names and program-header
+# types and flags of upstream's own binary. Because go.mod and go.sum are changed, Go marks the build itself:
+# `go version -m` reports the module as <tag>+dirty and vcs.modified=true, and the build requires both.
+# Build arguments come from images/tailscale.env via scripts/build.sh; target = tailscale.
+# Every RUN has no network, except the two that fetch the pinned source tree and its go.sum-verified modules.
+ARG UPSTREAM_IMAGE=docker.io/tailscale/tailscale:v1.104.7@sha256:72c1e19e0aedca96b8533bbb0b4368564410ff20b17e53b804eb6c1f04a31be4
+# Used for git, bash and readelf only: its Go is replaced by Tailscale's (TS_GO_TARBALL) before anything is built.
+ARG GO_IMAGE=docker.io/library/golang:1.27.4@sha256:205c7636d74e0ffbe3d007162df7d74f859f5a8c8322dfb9f907977686c126cf
+ARG TS_GO_TARBALL=https://github.com/tailscale/go/releases/download/build-1635316a95598e9fe1bff7267604daa94aa1c8ec/linux-amd64.tar.gz
+ARG TS_GO_SHA256=sha256:366968d5a7a240585533149572b8becc9bac8d9e6ff2712a4865a21c16b9f814
+ARG ZLIB_APK=https://dl-cdn.alpinelinux.org/alpine/v3.22/main/x86_64/zlib-1.4-r0.apk
+ARG ZLIB_SHA256=sha256:a271d6491037f7037010ac98b40f7d2b81c733f425b20294ee771b6ed7571038
+
+FROM ${UPSTREAM_IMAGE} AS upstream
+
+FROM ${GO_IMAGE} AS build
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+ARG UPSTREAM_REPO UPSTREAM_TAG UPSTREAM_COMMIT UPSTREAM_GO_VERSION TS_GO_REV TS_GO_TARBALL TS_GO_SHA256 \
+    XNET_VERSION COMPRESS_VERSION GO_VERSION
+ENV GOTOOLCHAIN=local GOFLAGS=-mod=readonly CGO_ENABLED=0 GOOS=linux GOARCH=amd64 GOAMD64=v1
+ADD --checksum=${TS_GO_SHA256} ${TS_GO_TARBALL} /tmp/tsgo.tar.gz
+RUN --network=none test "${TS_GO_TARBALL}" = "https://github.com/tailscale/go/releases/download/build-${TS_GO_REV}/linux-amd64.tar.gz" \
+ && rm -rf /usr/local/go && mkdir /usr/local/go \
+ && tar -C /usr/local/go --strip-components=1 -xzf /tmp/tsgo.tar.gz && rm /tmp/tsgo.tar.gz \
+ && test "$(command -v go)" = /usr/local/go/bin/go && test "$(go env GOVERSION)" = "go${GO_VERSION}"
+WORKDIR /src
+RUN git -c advice.detachedHead=false clone --quiet --depth 1 --branch "${UPSTREAM_TAG}" "${UPSTREAM_REPO}" . \
+ && test "$(git rev-parse HEAD)" = "${UPSTREAM_COMMIT}" \
+ && test "$(cat go.toolchain.rev)" = "${TS_GO_REV}"
+COPY patches/tailscale.patch /tmp/deps.patch
+RUN --network=none git apply --check /tmp/deps.patch && git apply /tmp/deps.patch \
+ && test "$(git diff --numstat | tr '\t\n' '  ')" = "2 2 go.mod 4 4 go.sum " \
+ && grep -qxP "\tgolang.org/x/net ${XNET_VERSION}" go.mod \
+ && grep -qxP "\tgithub.com/klauspost/compress ${COMPRESS_VERSION}" go.mod
+# Only the modules the three commands link are fetched (the tag's go.mod also lists its linters and tools).
+RUN go list -tags ts_kube,ts_package_container -deps ./cmd/tailscale ./cmd/tailscaled ./cmd/containerboot >/dev/null
+COPY --from=upstream /usr/local/bin/ /tmp/upstream/
+# norm: everything `go version -m` prints after its first line, less the two moved modules and the two lines
+# that mark a modified tree (the module version and vcs.modified), which `same` checks one by one.
+# same: one binary against upstream's. containerboot does not link klauspost/compress; a binary that links it
+# must have it at COMPRESS_VERSION, and each binary must link the same set of moved modules as upstream's.
+RUN --network=none GOPROXY=off go build -trimpath -tags ts_kube,ts_package_container \
+      -ldflags "-X tailscale.com/version.longStamp=${UPSTREAM_TAG#v}-t${UPSTREAM_COMMIT:0:9} -X tailscale.com/version.shortStamp=${UPSTREAM_TAG#v} -X tailscale.com/version.gitCommitStamp=${UPSTREAM_COMMIT}" \
+      -o /out/ ./cmd/tailscale ./cmd/tailscaled ./cmd/containerboot \
+ && moved='^\tdep\t(golang\.org/x/net|github\.com/klauspost/compress)\t' \
+ && norm() { tail -n +2 "$1" | grep -vP "${moved}" | grep -vP '^\t(mod\ttailscale\.com|build\tvcs\.modified=)'; } \
+ && sections() { readelf -SW "$1" | grep -oP '^\s+\[\s*\d+\]\s\K\S+'; } \
+ && segments() { readelf -lW "$1" | awk '/^ +[A-Z_]+ +0x/ { f = ""; for (i = 7; i < NF; i++) f = f $i; print $1, f }'; } \
+ && same() { go version -m "/out/$1" >"/tmp/$1.buildinfo" && go version -m "/tmp/upstream/$1" >"/tmp/$1.upstream-buildinfo" \
+      && test "$(head -n 1 "/tmp/$1.buildinfo")" = "/out/$1: go${GO_VERSION}" \
+      && test "$(head -n 1 "/tmp/$1.upstream-buildinfo")" = "/tmp/upstream/$1: go${UPSTREAM_GO_VERSION}" \
+      && grep -qP "^\tdep\tgolang\.org/x/net\t${XNET_VERSION}\t" "/tmp/$1.buildinfo" \
+      && test "$(grep -P "${moved}" "/tmp/$1.buildinfo" | cut -f3 | tr '\n' ' ')" = "$(grep -P "${moved}" "/tmp/$1.upstream-buildinfo" | cut -f3 | tr '\n' ' ')" \
+      && ! grep -P "^\tdep\tgithub\.com/klauspost/compress\t" "/tmp/$1.buildinfo" | grep -vqP "\t${COMPRESS_VERSION}\t" \
+      && grep -qxP "\tbuild\tvcs\.modified=true" "/tmp/$1.buildinfo" \
+      && grep -qxP "\tbuild\tvcs\.modified=false" "/tmp/$1.upstream-buildinfo" \
+      && grep -qxP "\tmod\ttailscale\.com\t${UPSTREAM_TAG}\+dirty\t" "/tmp/$1.buildinfo" \
+      && grep -qxP "\tmod\ttailscale\.com\t${UPSTREAM_TAG}\t" "/tmp/$1.upstream-buildinfo" \
+      && diff <(norm "/tmp/$1.upstream-buildinfo") <(norm "/tmp/$1.buildinfo") \
+      && diff <(sections "/tmp/upstream/$1") <(sections "/out/$1") \
+      && diff <(segments "/tmp/upstream/$1") <(segments "/out/$1") \
+      && sections "/out/$1" | grep -qx .symtab && segments "/out/$1" | grep -qx 'GNU_STACK RW'; } \
+ && same tailscale && same tailscaled && same containerboot \
+ && test "$(git status --porcelain --untracked-files=all --ignored | tr '\n' ' ')" = " M go.mod  M go.sum "
+
+# Upstream's file system with the three binaries replaced in place (same owner, mode and file time as upstream's)
+# and zlib upgraded from the pinned file. The rebuilt tools must print exactly what upstream's print, with one
+# mark: tailscale appends -dirty to the commit when the build's tree was modified, as go.mod and go.sum are.
+FROM upstream AS rootfs
+ARG UPSTREAM_COMMIT ZLIB_APK ZLIB_SHA256
+ADD --checksum=${ZLIB_SHA256} ${ZLIB_APK} /tmp/zlib.apk
+COPY --from=build /out/ /tmp/out/
+RUN --network=none set -eu; \
+    upstream_version="$(tailscaled --version)"; \
+    want="$(printf '%s\n' "${upstream_version}" | sed "s/^  tailscale commit: ${UPSTREAM_COMMIT}\$/&-dirty/")"; \
+    test "${want}" != "${upstream_version}"; \
+    for b in tailscale tailscaled containerboot; do \
+      test "$(stat -c '%a %u %g' "/usr/local/bin/$b")" = "555 0 0"; \
+      cat "/tmp/out/$b" >"/usr/local/bin/$b"; \
+      touch -d @0 "/usr/local/bin/$b"; \
+      test "$(stat -c '%a %u %g' "/usr/local/bin/$b")" = "555 0 0"; \
+    done; \
+    touch -d @0 /usr/local/bin; \
+    test "$(tailscaled --version)" = "${want}"; \
+    test "$(tailscale version)" = "${want}"; \
+    apk add --no-network /tmp/zlib.apk; \
+    apk info -v | grep -qx "$(basename "${ZLIB_APK}" .apk)"; \
+    rm -r /tmp/out /tmp/zlib.apk
+
+# One layer holds the whole final file system, so the replaced files are not in the image at all.
+# (WORKDIR below adds a second, empty layer.)
+FROM scratch AS tailscale
+ARG UPSTREAM_IMAGE UPSTREAM_REPO UPSTREAM_TAG UPSTREAM_COMMIT GO_VERSION TS_GO_REV XNET_VERSION XNET_FIX_COMMIT \
+    COMPRESS_VERSION COMPRESS_FIX_COMMIT ZLIB_APK FC_REVISION FC_COMMIT CREATED DOCS_URL
+COPY --from=rootfs / /
+# Upstream's runtime settings, restated because the image starts from scratch.
+ENV PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+LABEL org.opencontainers.image.source="https://github.com/FigureCollecting/store-images" \
+      org.opencontainers.image.revision="${FC_COMMIT}" \
+      org.opencontainers.image.version="${UPSTREAM_TAG}-${FC_REVISION}" \
+      org.opencontainers.image.created="${CREATED}" \
+      org.opencontainers.image.title="tailscale" \
+      org.opencontainers.image.description="Tailscale ${UPSTREAM_TAG}: upstream's image with its binaries rebuilt with golang.org/x/net ${XNET_VERSION} and klauspost/compress ${COMPRESS_VERSION}, and Alpine's zlib moved to the fixed package; no other change" \
+      org.opencontainers.image.documentation="${DOCS_URL}" \
+      org.opencontainers.image.licenses="BSD-3-Clause" \
+      org.opencontainers.image.vendor="FigureCollecting" \
+      org.opencontainers.image.base.name="${UPSTREAM_IMAGE}" \
+      com.figurecollecting.upstream.source="${UPSTREAM_REPO}" \
+      com.figurecollecting.upstream.tag="${UPSTREAM_TAG}" \
+      com.figurecollecting.upstream.commit="${UPSTREAM_COMMIT}" \
+      com.figurecollecting.go.version="${GO_VERSION}" \
+      com.figurecollecting.tailscale-go.rev="${TS_GO_REV}" \
+      com.figurecollecting.x-net.version="${XNET_VERSION}" \
+      com.figurecollecting.x-net.fix-commit="${XNET_FIX_COMMIT}" \
+      com.figurecollecting.compress.version="${COMPRESS_VERSION}" \
+      com.figurecollecting.compress.fix-commit="${COMPRESS_FIX_COMMIT}" \
+      com.figurecollecting.zlib.package="${ZLIB_APK}"
+WORKDIR /
+CMD ["/usr/local/bin/containerboot"]

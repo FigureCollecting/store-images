@@ -14,6 +14,7 @@ VT = "# comment\nAPP_NAME=victoria-traces\nUPSTREAM_REPO=https://github.com/Vict
 GF = ("APP_NAME=grafana\nUPSTREAM_REPO=https://github.com/grafana/grafana\nUPSTREAM_TAG=v13.3.1\nWATCH_ACTION=rebuild\n"
       "VLOGS_DS_REPO=https://github.com/VictoriaMetrics/victorialogs-datasource\nVLOGS_DS_TAG=v0.34.0\n"
       "JAEGER_DS_REPO=https://github.com/grafana/grafana-jaeger-datasource\nJAEGER_DS_TAG=v13.0.8\n")
+TS = "APP_NAME=tailscale\nUPSTREAM_REPO=https://github.com/tailscale/tailscale\nUPSTREAM_TAG=v1.104.7\nWATCH_ACTION=retire\n"
 PATCHED = "UPSTREAM_PATCH_MODULE=github.com/apache/thrift\nUPSTREAM_PATCH_VERSION=v0.25.0\n"
 GOMOD = ("module github.com/grafana/grafana\n\ngo 1.27.4\n\nrequire (\n"
          "\tgithub.com/apache/thrift-extra v9.9.9\n"
@@ -282,8 +283,39 @@ class WatchTest(unittest.TestCase):
         self.images(grafana=GF.replace("WATCH_ACTION=rebuild", "WATCH_ACTION=ignore"))
         rc, out = self.run_watch({})
         self.assertEqual(rc, 2)
-        self.assertIn("::error title=Upstream watch failed::grafana: WATCH_ACTION 'ignore' is not archive or rebuild", out)
+        self.assertIn("::error title=Upstream watch failed::grafana: WATCH_ACTION 'ignore' is not archive, rebuild "
+                      "or retire\n", out)
         self.assertEqual(self.calls, [])
+
+    def test_a_newer_release_of_a_retire_definition_asks_for_a_scan_of_upstreams_image(self):
+        # A retire image exists only until upstream's own image passes the scan gate. The repository and its
+        # other rebuilds stay, and whether the release is fixed is the gate's answer, not a go.mod's.
+        self.images(tailscale=TS + "UPSTREAM_PATCH_MODULE=golang.org/x/net\nUPSTREAM_PATCH_VERSION=v0.62.0\n",
+                    victoria_traces=VT)
+        rc, out = self.run_watch({"tailscale/tailscale": [rel("v1.106.0"), rel("v1.105.0-pre"), rel("v1.104.7")],
+                                  "VictoriaMetrics/VictoriaTraces": [rel("v0.12.1")]})
+        self.assertEqual(rc, 1)
+        self.assertIn("::error title=Upstream released tailscale v1.106.0::tailscale: base v1.104.7, upstream "
+                      "released v1.106.0. Run scripts/scan.sh on upstream's image of it. If the gate passes, re-pin "
+                      "consumers to upstream's image and delete images/tailscale.env with its Dockerfile, patch and "
+                      "smoke test; if it fails, re-pin images/tailscale.env and its Dockerfile to it, rebuild and "
+                      "bump FC_REVISION.\n", out)
+        self.assertNotIn("archive this repository", out)
+        self.assertEqual(self.gomod_calls, [])
+        self.assertEqual(out.count("::error"), 1, out)
+
+    def test_a_retire_definition_at_the_newest_release_passes(self):
+        self.images(tailscale=TS)
+        rc, out = self.run_watch({"tailscale/tailscale": [rel("v1.105.0-pre"), rel("v1.104.7"), rel("v1.104.6")]})
+        self.assertEqual(rc, 0)
+        self.assertEqual(out, "tailscale: base v1.104.7, newest upstream release v1.104.7: no newer release\n")
+
+    def test_the_tailscale_definition_in_this_repository_is_retired_on_a_release(self):
+        env = upstream_watch.read_env(os.path.join(os.path.dirname(__file__), "..", "images", "tailscale.env"))
+        self.assertEqual(env.get("WATCH_ACTION"), "retire")
+        self.assertEqual(upstream_watch.watched(env), ["UPSTREAM"])
+        self.assertEqual(env["UPSTREAM_REPO"], "https://github.com/tailscale/tailscale")
+        self.assertIsNotNone(upstream_watch.version(env["UPSTREAM_TAG"]))
 
     def test_the_grafana_definition_in_this_repository_watches_all_three_upstreams(self):
         env = upstream_watch.read_env(os.path.join(os.path.dirname(__file__), "..", "images", "grafana.env"))

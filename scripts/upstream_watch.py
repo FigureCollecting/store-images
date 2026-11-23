@@ -8,7 +8,8 @@ of the definition (a component baked into the image) is checked the same way.
 Exit 1 if any image has a newer upstream release, 2 if a check could not be made, 0 otherwise.
 For an images/ entry a newer release is the signal to re-pin consumers to upstream's own image and
 archive this repository, or, for a definition with WATCH_ACTION=rebuild, to re-pin the recipe and
-rebuild; for a watch/ entry, to re-pin the store and bump the watch tag (the images/ rebuilds stay).
+rebuild, or, with WATCH_ACTION=retire, to scan upstream's image of the release and delete that one recipe
+if it passes; for a watch/ entry, to re-pin the store and bump the watch tag (the images/ rebuilds stay).
 A WATCH_ACTION=rebuild definition that rebuilds upstream's server only to move UPSTREAM_PATCH_MODULE to
 UPSTREAM_PATCH_VERSION is also told whether the newer release ships that version itself, in which case
 the rebuild is dropped. Opens nothing.
@@ -29,6 +30,9 @@ GITHUB = re.compile(r"^https://github\.com/([\w.-]+/[\w.-]+?)(?:\.git)?$")
 ACTIONS = {
     "archive": "Check its image's Go version, re-pin to upstream's image, and archive this repository.",
     "rebuild": "Re-pin images/{image}.env and its Dockerfile to it, rebuild and bump FC_REVISION.",
+    "retire": "Run scripts/scan.sh on upstream's image of it. If the gate passes, re-pin consumers to upstream's "
+              "image and delete images/{image}.env with its Dockerfile, patch and smoke test; if it fails, re-pin "
+              "images/{image}.env and its Dockerfile to it, rebuild and bump FC_REVISION.",
 }
 
 
@@ -152,7 +156,8 @@ def check_image(name, env, fetch, read_gomod, rebuilt=None):
     """Return the (status, message) of every watched repository of one image definition."""
     action = env.get("WATCH_ACTION", "archive")
     if action not in ACTIONS:
-        return [(2, f"{name}: WATCH_ACTION '{action}' is not {' or '.join(sorted(ACTIONS))}")]
+        known = sorted(ACTIONS)
+        return [(2, f"{name}: WATCH_ACTION '{action}' is not {', '.join(known[:-1])} or {known[-1]}")]
     return [check(name, env, fetch, key, read_gomod, rebuilt) for key in watched(env)]
 
 
