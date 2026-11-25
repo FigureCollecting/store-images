@@ -1,5 +1,6 @@
 """The Tailscale rebuild: upstream's image with its three binaries rebuilt from the release tag with the fixed
-golang.org/x/net and klauspost/compress, and Alpine's zlib moved to the fixed package. Nothing else changes."""
+golang.org/x/net and klauspost/compress, and Alpine's zlib, libcrypto3 and libssl3 moved to the fixed packages.
+Nothing else changes."""
 import os
 import re
 import sys
@@ -334,6 +335,12 @@ class ReadmeTest(unittest.TestCase):
             with self.subTest(want=want):
                 self.assertIn(want, readme)
         self.assertNotIn("OpenSSL stays upstream's", readme)
+
+    def test_this_modules_docstring_names_every_moved_alpine_package(self):
+        doc = " ".join(__doc__.split())
+        for name in PACKAGES:
+            with self.subTest(package=name):
+                self.assertIn(name, doc)
 
 
 if __name__ == "__main__":
