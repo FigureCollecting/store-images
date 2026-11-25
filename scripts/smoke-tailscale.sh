@@ -8,8 +8,9 @@
 # the build; `tailscaled --version` and `tailscale version` print what upstream's image prints, with -dirty
 # appended to the commit (the tree the build came from has a changed go.mod and go.sum); the
 # three binaries are built by the pinned Go from the tag's commit with upstream's settings and carry the two
-# moved modules at the pinned versions; zlib is the fixed package; against upstream's file system only the
-# three binaries, zlib's library and apk's records differ; and containerboot starts tailscaled as the
+# moved modules at the pinned versions; zlib, libcrypto3 and libssl3 are the fixed packages; against upstream's
+# file system only the three binaries, those packages' libraries and apk's records differ; and containerboot
+# starts tailscaled as the
 # deployments run it (uid 10001, read-only root, no capabilities, userspace networking) and the daemon answers
 # on its socket that it needs a login. containerboot has no --help: it reads its settings from TS_* variables.
 # Needs upstream's image (UPSTREAM_IMAGE, pulled by digest) for the comparisons.
@@ -18,6 +19,8 @@ set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 GO_IMAGE=$(sed -n 's/^ARG GO_IMAGE=//p' "$ROOT/Dockerfile.tailscale")
 ZLIB_APK=$(sed -n 's/^ARG ZLIB_APK=//p' "$ROOT/Dockerfile.tailscale")
+LIBCRYPTO3_APK=$(sed -n 's/^ARG LIBCRYPTO3_APK=//p' "$ROOT/Dockerfile.tailscale")
+LIBSSL3_APK=$(sed -n 's/^ARG LIBSSL3_APK=//p' "$ROOT/Dockerfile.tailscale")
 [ $# -eq 2 ] || { echo "usage: $0 <app> <image.tar | image-ref>" >&2; exit 2; }
 app=$1 target=$2
 [ -f "$ROOT/images/$app.env" ] || { echo "no image definition images/$app.env" >&2; exit 2; }
@@ -67,6 +70,8 @@ com.figurecollecting.tailscale-go.rev $TS_GO_REV
 com.figurecollecting.x-net.version $XNET_VERSION
 com.figurecollecting.compress.version $COMPRESS_VERSION
 com.figurecollecting.zlib.package $ZLIB_APK
+com.figurecollecting.libcrypto3.package $LIBCRYPTO3_APK
+com.figurecollecting.libssl3.package $LIBSSL3_APK
 EOF
 
 # The version stamps are upstream's: both tools print what upstream's image prints, with one mark. tailscale
@@ -82,8 +87,12 @@ for tool in "tailscaled --version" "tailscale version"; do
     grep -qzP "(?s)^\Q${UPSTREAM_TAG#v}\E\n.*tailscale commit: $UPSTREAM_COMMIT-dirty\n.*go version: go\Q$GO_VERSION\E \(tailscale/go ${TS_GO_REV:0:10}\)" <<<"$said"
 done
 
-zlib=$(docker run --rm --network none "$img" apk info -v 2>/dev/null | grep '^zlib-')
-check zlib "installed package '${zlib}'" test "$zlib" = "$(basename "$ZLIB_APK" .apk)"
+docker run --rm --network none "$img" apk info -v >"$work/packages" 2>/dev/null
+for pkg in zlib libcrypto3 libssl3; do
+  pinned="${pkg^^}_APK"
+  installed=$(grep -E "^$pkg-[0-9]" "$work/packages")
+  check packages "installed package '${installed}'" test -n "${!pinned}" -a "$installed" = "$(basename "${!pinned}" .apk)"
+done
 
 # The three binaries are the rebuilt ones: upstream's Go, commit and settings, and the two moved modules.
 docker create --network none --name "$name-ours" "$img" >/dev/null
@@ -120,17 +129,20 @@ others=$(grep -E 'dep[[:space:]]+(golang.org/x/net|github.com/klauspost/compress
   | grep -cvE "(golang.org/x/net[[:space:]]+${XNET_VERSION}|github.com/klauspost/compress[[:space:]]+${COMPRESS_VERSION})[[:space:]]")
 check buildinfo "$others lines carry either module at another version" test "$others" = 0
 
-# Against upstream's file system, only the three binaries, zlib's library and apk's records may differ.
+# Against upstream's file system, only the three binaries, the moved packages' libraries (zlib's; OpenSSL's two
+# libraries, engines and legacy provider) and apk's records may differ.
 docker export "$name-ours" >"$work/ours.tar" 2>/dev/null
 docker export "$name-upstream" >"$work/upstream.tar" 2>/dev/null
 python3 "$ROOT/scripts/rootfs_diff.py" "$work/upstream.tar" "$work/ours.tar" >"$work/rootfs" 2>&1
 rootfs_rc=$?
-expected='^changed usr/local/bin/(tailscale|tailscaled|containerboot)$|^(added|removed|changed) (usr/)?lib/libz\.so\.[0-9.]+$|^changed (lib/apk/db/(installed|scripts\.tar|triggers)|etc/apk/world)$'
+expected='^changed usr/local/bin/(tailscale|tailscaled|containerboot)$|^(added|removed|changed) (usr/)?lib/libz\.so\.[0-9.]+$|^changed usr/lib/(lib(crypto|ssl)\.so\.3|engines-3/[a-z_]+\.so|ossl-modules/legacy\.so)$|^changed (lib/apk/db/(installed|scripts\.tar|triggers)|etc/apk/world)$'
 unexpected=$(grep -cvE "$expected" "$work/rootfs")
 binaries=$(grep -cE '^changed usr/local/bin/(tailscale|tailscaled|containerboot)$' "$work/rootfs")
 check rootfs "$(grep -c . "$work/rootfs") paths differ from upstream's image, $unexpected unexpected: $(tr '\n' ';' <"$work/rootfs" | cut -c1-600)" \
   test "$rootfs_rc" = 0 -a "$unexpected" = 0 -a "$binaries" = 3
 check rootfs "zlib's library changed: $(grep -cE ' (usr/)?lib/libz\.so\.' "$work/rootfs") lines" grep -qE ' (usr/)?lib/libz\.so\.' "$work/rootfs"
+openssl=$(grep -cE '^changed (usr/)?lib/lib(crypto|ssl)\.so\.3$' "$work/rootfs")
+check rootfs "OpenSSL's two libraries changed: $openssl lines" test "$openssl" = 2
 
 # As the deployments run it: containerboot starts tailscaled, which answers on its socket and has no login.
 docker run -d --name "$name" --network none --user 10001:10001 --read-only --cap-drop ALL --security-opt no-new-privileges --memory 512m --tmpfs /tmp --tmpfs /var/lib/tailscale:uid=10001,gid=10001,mode=0700 --tmpfs /var/run/tailscale:uid=10001,gid=10001,mode=0700 -e TS_USERSPACE=true -e TS_KUBE_SECRET= -e TS_SOCKET=/var/run/tailscale/tailscaled.sock -e TS_STATE_DIR=/var/lib/tailscale/state -e TS_AUTH_ONCE=true -e TS_HOSTNAME=smoke -e TS_NO_LOGS_NO_SUPPORT=true "$img" >/dev/null
