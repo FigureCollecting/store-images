@@ -142,7 +142,11 @@ Known limits:
   the same bytes: 5 symbols exist only in the tag build. They come from two public non-security commits
   that upstream's binary lacks, #138361 (retry of the basic-role seeder lock) and #138800 (Azure
   Monitor multi-resource fan-out). Upstream's binary carries both security patches (checked 2026-11-25
-  by symbols and strings). Neither missing commit touches what the viewer uses. The image label
+  by symbols and strings). #138800 is in the Azure Monitor data source, which the viewer does not use.
+  #138361 runs at every start: if a start is killed while it seeds basic roles, each start in the next
+  2 minutes exits with "there is already a lock for this actionName: oss-ac-basic-role-seeder", where
+  the tag's build waits for the lock (checked 2026-11-25). Kubernetes restarts the pod, and it starts
+  once the lock is 2 minutes old. The image label
   `com.figurecollecting.upstream.commit` names the tag commit, not the build commit bd75498687, which
   is not in the public repository.
 - The operator's browser still fetches from third parties in at least three cases, all upstream

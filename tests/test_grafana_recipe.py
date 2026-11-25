@@ -217,6 +217,17 @@ class HardeningTest(unittest.TestCase):
             with self.subTest(needle=needle):
                 self.assertIn(needle, limits)
 
+    def test_the_readme_says_the_missing_seeder_lock_retry_can_stop_a_start(self):
+        readme = " ".join(read("README.md").split())
+        limits = readme.split("## Grafana", 1)[1].split("## Tailscale", 1)[0].split("Known limits:", 1)[1]
+        self.assertNotIn("Neither missing commit touches what the viewer uses", readme)
+        for needle in ("#138800 is in the Azure Monitor data source, which the viewer does not use",
+                       "#138361 runs at every start",
+                       "there is already a lock for this actionName: oss-ac-basic-role-seeder",
+                       "once the lock is 2 minutes old"):
+            with self.subTest(needle=needle):
+                self.assertIn(needle, limits)
+
     def test_the_header_does_not_call_upstreams_grafana_files_root_owned(self):
         header = " ".join(line.lstrip("# ") for line in read("Dockerfile.grafana").split("\nARG ", 1)[0].splitlines())
         self.assertNotIn("everything else outside the data, log and temp paths root-owned", header)
