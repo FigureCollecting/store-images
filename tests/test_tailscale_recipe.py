@@ -1,5 +1,6 @@
 """The Tailscale rebuild: upstream's image with its three binaries rebuilt from the release tag with the fixed
-golang.org/x/net and klauspost/compress, and Alpine's zlib moved to the fixed package. Nothing else changes."""
+golang.org/x/net and klauspost/compress, and Alpine's zlib, libcrypto3 and libssl3 moved to the fixed packages.
+Nothing else changes."""
 import os
 import re
 import sys
@@ -18,6 +19,14 @@ COMPRESS = "github.com/klauspost/compress"
 XNET_FLOOR = (0, 62, 0)
 COMPRESS_FLOOR = (1, 20, 2)
 ZLIB_FIXED = "1.4-r0"
+# OpenSSL: the scan gate on 2026-11-25 reports CVE-2026-124709 (trivy, fixed in 3.5.9-r2) and four CVEs fixed in
+# 3.5.9-r1 (grype) on upstream's 3.5.9-r0.
+OPENSSL_FIXED = "3.5.9-r2"
+# The Alpine packages moved to pinned files, each with its fixed version.
+PACKAGES = {"zlib": ZLIB_FIXED, "libcrypto3": OPENSSL_FIXED, "libssl3": OPENSSL_FIXED}
+# FC_REVISIONs already published to ghcr.io/figurecollecting/tailscale; a tag is never overwritten, so a change to
+# what the image holds needs a revision not in this list.
+PUBLISHED_REVISIONS = ("fc1",)  # fc1: 2026-11-23, OpenSSL still upstream's 3.5.9-r0
 BINARIES = ("tailscale", "tailscaled", "containerboot")
 
 
@@ -95,6 +104,7 @@ class DefinitionTest(unittest.TestCase):
         self.assertRegex(self.env["UPSTREAM_IMAGE"],
                          rf"^docker\.io/tailscale/tailscale:{re.escape(self.env['UPSTREAM_TAG'])}@sha256:[0-9a-f]{{64}}$")
         self.assertRegex(self.env["FC_REVISION"], r"^fc[1-9][0-9]*$")
+        self.assertNotIn(self.env["FC_REVISION"], PUBLISHED_REVISIONS)
         self.assertIn(f"\nARG UPSTREAM_IMAGE={self.env['UPSTREAM_IMAGE']}\n", self.text)  # the pin check reads defaults
         self.assertIn("FROM ${UPSTREAM_IMAGE} AS upstream\n", self.text)
 
@@ -216,16 +226,32 @@ class RuntimeStageTest(unittest.TestCase):
         self.assertIn('test "$(tailscaled --version)" = "${want}"', run[0])
         self.assertIn('test "$(tailscale version)" = "${want}"', run[0])
         self.assertIn("-dirty", read("scripts/smoke-tailscale.sh"))
-        self.assertIn("rm -r /tmp/out /tmp/zlib.apk", run[0])
+        self.assertIn("rm -r /tmp/out /tmp/zlib.apk /tmp/libcrypto3.apk /tmp/libssl3.apk", run[0])
 
-    def test_zlib_is_a_pinned_file_at_the_fixed_version(self):
-        self.assertRegex(self.text, rf"(?m)^ARG ZLIB_APK=https://dl-cdn\.alpinelinux\.org/alpine/v3\.22/main/x86_64/"
-                                    rf"zlib-{re.escape(ZLIB_FIXED)}\.apk$")
-        self.assertRegex(self.text, r"(?m)^ARG ZLIB_SHA256=sha256:[0-9a-f]{64}$")
-        self.assertIn(("ADD", "--checksum=${ZLIB_SHA256} ${ZLIB_APK} /tmp/zlib.apk"), self.rootfs)
+    def test_the_alpine_packages_are_pinned_files_at_the_fixed_versions(self):
         run = next(a for k, a in self.rootfs if k == "RUN")
-        self.assertIn("apk add --no-network /tmp/zlib.apk", run)
-        self.assertIn('apk info -v | grep -qx "$(basename "${ZLIB_APK}" .apk)"', run)
+        self.assertIn("apk add --no-network /tmp/zlib.apk /tmp/libcrypto3.apk /tmp/libssl3.apk", run)
+        args = next(a for k, a in self.rootfs if k == "ARG").split()
+        for name, fixed in PACKAGES.items():
+            var = name.upper()
+            with self.subTest(package=name):
+                self.assertRegex(self.text, rf"(?m)^ARG {var}_APK=https://dl-cdn\.alpinelinux\.org/alpine/v3\.22/main/"
+                                            rf"x86_64/{name}-{re.escape(fixed)}\.apk$")
+                self.assertRegex(self.text, rf"(?m)^ARG {var}_SHA256=sha256:[0-9a-f]{{64}}$")
+                self.assertIn(f"{var}_APK", args)
+                self.assertIn(f"{var}_SHA256", args)
+                self.assertIn(("ADD", f"--checksum=${{{var}_SHA256}} ${{{var}_APK}} /tmp/{name}.apk"), self.rootfs)
+                self.assertIn(f'apk info -v | grep -qx "$(basename "${{{var}_APK}}" .apk)"', run)
+        # The fixed packages go in after the binaries are checked, before the stage's files are removed.
+        self.assertLess(run.index('test "$(tailscale version)" = "${want}"'), run.index("apk add --no-network"))
+        self.assertLess(run.index("apk add --no-network"), run.index("rm -r /tmp/out"))
+
+    def test_both_openssl_packages_come_from_one_build(self):
+        # libssl3 requires the libcrypto3 of its own build; a mixed pair would not install.
+        apk = {name: re.search(rf"(?m)^ARG {name.upper()}_APK=\S+/{name}-(\S+)\.apk$", self.text)
+               for name in ("libcrypto3", "libssl3")}
+        self.assertTrue(all(apk.values()), apk)
+        self.assertEqual(apk["libcrypto3"].group(1), apk["libssl3"].group(1))
 
     def test_the_image_is_one_layer_with_upstreams_runtime_settings(self):
         # Upstream's image: no user (the deployment sets one), Cmd containerboot, no entrypoint, PATH, workdir /.
@@ -251,9 +277,14 @@ class RuntimeStageTest(unittest.TestCase):
                      'com.figurecollecting.x-net.fix-commit="${XNET_FIX_COMMIT}"',
                      'com.figurecollecting.compress.version="${COMPRESS_VERSION}"',
                      'com.figurecollecting.compress.fix-commit="${COMPRESS_FIX_COMMIT}"',
-                     'com.figurecollecting.zlib.package="${ZLIB_APK}"'):
+                     'com.figurecollecting.zlib.package="${ZLIB_APK}"',
+                     'com.figurecollecting.libcrypto3.package="${LIBCRYPTO3_APK}"',
+                     'com.figurecollecting.libssl3.package="${LIBSSL3_APK}"'):
             with self.subTest(label=want):
                 self.assertIn(want, label)
+        args = next(a for k, a in self.final if k == "ARG").split()
+        for var in ("ZLIB_APK", "LIBCRYPTO3_APK", "LIBSSL3_APK"):
+            self.assertIn(var, args)
 
 
 class SmokeTest(unittest.TestCase):
@@ -274,8 +305,12 @@ class SmokeTest(unittest.TestCase):
                      "-e TS_USERSPACE=true", "-e TS_KUBE_SECRET=", "NeedsLogin"):
             self.assertIn(want, self.smoke)
 
-    def test_the_smoke_checks_versions_modules_zlib_and_the_file_system(self):
-        for want in ("check version ", "check config ", "check labels ", "check zlib ", "check rootfs ",
+    def test_the_smoke_checks_versions_modules_packages_and_the_file_system(self):
+        for want in ("check version ", "check config ", "check labels ", "check packages ", "check rootfs ",
+                     "for pkg in zlib libcrypto3 libssl3; do",
+                     "com.figurecollecting.libcrypto3.package $LIBCRYPTO3_APK",
+                     "com.figurecollecting.libssl3.package $LIBSSL3_APK",
+                     r"(usr/)?lib/lib(crypto|ssl)\.so\.",
                      "check boot ", "check buildinfo ",
                      "dep[[:space:]]+golang.org/x/net[[:space:]]+${XNET_VERSION}[[:space:]]",
                      "dep[[:space:]]+github.com/klauspost/compress[[:space:]]+${COMPRESS_VERSION}[[:space:]]",
@@ -296,9 +331,16 @@ class ReadmeTest(unittest.TestCase):
         for want in (f"`{XNET}` {env['XNET_VERSION']}", f"`{COMPRESS}` {env['COMPRESS_VERSION']}",
                      f"zlib {ZLIB_FIXED}", "CVE-2026-78661", "CVE-2026-116591", "CVE-2026-4738",
                      f"ghcr.io/figurecollecting/tailscale:{env['UPSTREAM_TAG']}-{env['FC_REVISION']}",
-                     "Delete the recipe"):
+                     "Delete the recipe", f"libcrypto3 and libssl3 {OPENSSL_FIXED}", "CVE-2026-124709"):
             with self.subTest(want=want):
                 self.assertIn(want, readme)
+        self.assertNotIn("OpenSSL stays upstream's", readme)
+
+    def test_this_modules_docstring_names_every_moved_alpine_package(self):
+        doc = " ".join(__doc__.split())
+        for name in PACKAGES:
+            with self.subTest(package=name):
+                self.assertIn(name, doc)
 
 
 if __name__ == "__main__":
