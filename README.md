@@ -182,18 +182,20 @@ Known limits:
 ## Tailscale
 
 `Dockerfile.tailscale` starts from upstream's `tailscale/tailscale` image of a release tag, pinned by
-digest, and changes three things. The image is published as
-`ghcr.io/figurecollecting/tailscale:v1.104.7-fc1`.
+digest, and changes four things. The image is published as
+`ghcr.io/figurecollecting/tailscale:v1.104.7-fc2`. v1.104.7-fc1 had upstream's OpenSSL.
 
 | Component | Upstream v1.104.7 (cbc74fe48e) | Ours | Fixes |
 |---|---|---|---|
 | `golang.org/x/net` in `tailscale`, `tailscaled`, `containerboot` | v0.60.0 | `golang.org/x/net` v0.62.0 (upstream d064d751 on main) | CVE-2026-78661 |
 | `github.com/klauspost/compress` in `tailscale`, `tailscaled` | v1.20.0 | `github.com/klauspost/compress` v1.20.2 (upstream 46f93879 on main) | CVE-2026-116591 |
 | zlib (Alpine 3.22) | 1.3.2-r1 | zlib 1.4-r0 (a pinned, sha256-verified file) | CVE-2026-4738 |
+| libcrypto3, libssl3 (Alpine 3.22) | 3.5.9-r0 | libcrypto3 and libssl3 3.5.9-r2 (pinned, sha256-verified files) | CVE-2026-124709 (fixed in -r2); CVE-2026-107496, CVE-2026-88823, CVE-2026-95691, CVE-2026-95692 (fixed in -r1) |
 
-Upstream's v1.104.7 image fails the scan gate on these three (checked 2026-11-23: trivy reports the
-first, grype the other two). Both module versions are the ones upstream's own v1.106.0 tag ships;
-`release-branch/1.104` had neither on that day.
+Upstream's v1.104.7 image fails the scan gate on the first three (checked 2026-11-23: trivy reports the
+first, grype the other two). On 2026-11-25 the gate also failed v1.104.7-fc1 on OpenSSL: trivy reports
+CVE-2026-124709 (fixed in 3.5.9-r2), grype the four fixed in 3.5.9-r1. Both module versions are the
+ones upstream's own v1.106.0 tag ships; `release-branch/1.104` had neither on that day.
 
 The three binaries are built from the clean tag plus `patches/tailscale.patch` (the two module lines in
 `go.mod` and their `go.sum` lines) with upstream's toolchain, Tailscale's fork of Go at the revision
@@ -211,7 +213,7 @@ line changed. The version stamps are upstream's too: the short and long versions
 (`1.104.7-tcbc74fe48`), and `tailscale version` prints upstream's commit with `-dirty` appended, which
 Tailscale adds by itself to a build from a changed tree. That mark, the label set and `go version -m` on
 a binary tell the two images apart. The whole file system is one layer, so the replaced binaries and the
-old zlib are in no layer.
+old zlib and OpenSSL are in no layer.
 
 The smoke test gives no container a network or a key, so it joins no tailnet. It compares the image
 with upstream's (config, version output, and every path of the file system), reads the three
@@ -227,16 +229,13 @@ changes, on 2026-11-23; its image was not published yet when this recipe was wri
 
 Known limits:
 
-- The zlib pin is a file on Alpine's CDN, which keeps only the current package version. When Alpine
-  supersedes 1.4-r0 in v3.22 the URL returns 404 and the build fails until it is re-pinned.
-- `apk add` of the file records the package in `/etc/apk/world`, pinned to that file's checksum. A
-  later `apk upgrade` inside the image, which nothing here runs, would refuse to move zlib.
+- The zlib, `libcrypto3` and `libssl3` pins are files on Alpine's CDN, which keeps only the current
+  package version. When Alpine supersedes 1.4-r0 (or 3.5.9-r2) in v3.22 the URL returns 404 and the
+  build fails until it is re-pinned.
+- `apk add` of a file records the package in `/etc/apk/world`, pinned to that file's checksum. A
+  later `apk upgrade` inside the image, which nothing here runs, would refuse to move the three packages.
 - The Tailscale toolchain is a release asset of `github.com/tailscale/go`, verified by checksum only.
-- OpenSSL stays upstream's (`libcrypto3` and `libssl3` 3.5.9-r0). Alpine's security database names
-  3.5.9-r1 as the fix for five CVEs in v3.22, but v3.22 had not published that package on 2026-11-23
-  and neither scanner reported a fix yet. When they do, the gate fails for this image and for
-  upstream's; pin the two packages then, as `Dockerfile.grafana` does. The Tailscale binaries are
-  static Go and do not load OpenSSL.
+- The Tailscale binaries are static Go and do not load OpenSSL; `apk` and `ssl_client` in the image do.
 
 ## Layout
 
