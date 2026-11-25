@@ -6,7 +6,8 @@
 # The container gets --network none, so every probe runs inside it (docker exec) and any attempt to
 # reach the outside shows up in its log as a failed dial. Checks: it runs as the non-root upstream
 # user; /api/health is OK at the pinned version; the baked-in plugins are listed, the only external
-# ones, and their backends answer and are the rebuilt binaries (`go version -m`); telemetry, update
+# ones, and their backends answer and are the rebuilt binaries (`go version -m`); the server is upstream's
+# release build with the fixed module; telemetry, update
 # checks, the news feed, the plugin catalog, runtime plugin installs and Cloud Migration are off; the
 # running user can write nothing outside the data, log and temp paths; and the log holds no outbound
 # attempt.
@@ -198,19 +199,18 @@ vlogs dep[[:space:]]+github.com/klauspost/compress[[:space:]]+${COMPRESS_VERSION
 vlogs build[[:space:]]+vcs.revision=$VLOGS_DS_COMMIT\$
 vlogs build[[:space:]]+CGO_ENABLED=0\$
 vlogs pluginID.{1,4}victoriametrics-logs-datasource.{1,20}version.{1,4}${VLOGS_DS_TAG#v}[^0-9]
-server ^/b/server: go$GO_VERSION\$
+server ^/b/server: go$UPSTREAM_GO_VERSION\$
 server path[[:space:]]+github.com/grafana/grafana/pkg/cmd/grafana\$
-server dep[[:space:]]+${UPSTREAM_PATCH_MODULE}[[:space:]]+${UPSTREAM_PATCH_VERSION}[[:space:]]
+server dep[[:space:]]+${UPSTREAM_FIXED_MODULE}[[:space:]]+${UPSTREAM_FIXED_VERSION}[[:space:]]
 server build[[:space:]]+CGO_ENABLED=0\$
 server build[[:space:]]+-trimpath=true\$
 EOF
 
-# The server is the rebuilt one and says so: upstream's version, the public tag's commit, our patch in the branch.
-branch="${UPSTREAM_TAG}-fc-${UPSTREAM_PATCH_MODULE##*/}-${UPSTREAM_PATCH_VERSION}"
+# The server is upstream's release build and says so: its version, and the commit and branch upstream built it from.
 said=$(docker run --rm --network none --entrypoint grafana "$img" server -v 2>&1 | head -1)
 check server-version "grafana server -v -> '${said}'" \
-  test "$said" = "Version ${UPSTREAM_TAG#v} (commit: ${UPSTREAM_COMMIT}, branch: ${branch})"
-check server-commit "/api/health commit is ${UPSTREAM_COMMIT}" is "$health" .commit "$UPSTREAM_COMMIT"
+  test "$said" = "Version ${UPSTREAM_TAG#v} (commit: ${UPSTREAM_BUILD_COMMIT}, branch: ${UPSTREAM_BUILD_BRANCH})"
+check server-commit "/api/health commit is ${UPSTREAM_BUILD_COMMIT}" is "$health" .commit "$UPSTREAM_BUILD_COMMIT"
 
 [ "$failures" = 0 ] || { echo "--- container log (warnings and errors, tail)"; docker logs "$name" 2>&1 | grep -E 'level=(warn|error)' | tail -15 | cut -c1-300; }
 echo "SMOKE $([ "$failures" = 0 ] && echo PASS || echo "FAIL ($failures)") $app $img"

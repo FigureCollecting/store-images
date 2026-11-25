@@ -1,4 +1,5 @@
-"""The Grafana recipe keeps its server rebuild: the patched module version cannot be dropped quietly."""
+"""The Grafana recipe is at or above the release the cluster requires, and uses upstream's server unchanged
+only while that server carries the module fix the earlier builds had to patch in."""
 import os
 import re
 import sys
@@ -8,6 +9,11 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scripts"))
 import upstream_watch  # noqa: E402
 
 ROOT = os.path.join(os.path.dirname(__file__), "..")
+# fc-infra refuses to apply a Grafana image below this release (viewer APPLY.md, GRAFANA_FLOOR): 13.3.2 fixes
+# CVE-2026-107561 and CVE-2026-88960 in the server's own code.
+GRAFANA_FLOOR = (13, 3, 2, 0)
+# github.com/apache/thrift v0.24.0 is what the scan gate reported in upstream's 13.3.1 server.
+FIXED_MODULE, FIXED_FLOOR = "github.com/apache/thrift", (0, 25, 0, 0)
 
 
 def read(name):
@@ -15,58 +21,100 @@ def read(name):
         return fh.read()
 
 
-class ServerRebuildTest(unittest.TestCase):
+class ReleaseTest(unittest.TestCase):
     def setUp(self):
         self.env = upstream_watch.read_env(os.path.join(ROOT, "images", "grafana.env"))
-        self.module = self.env["UPSTREAM_PATCH_MODULE"]
-        self.version = self.env["UPSTREAM_PATCH_VERSION"]
 
-    def test_the_patch_moves_exactly_the_named_module_to_the_named_version(self):
-        patch = read("patches/grafana-server.patch")
-        added = [line[1:] for line in patch.splitlines() if line.startswith("+") and not line.startswith("+++")]
-        removed = [line[1:] for line in patch.splitlines() if line.startswith("-") and not line.startswith("---")]
-        self.assertEqual(len(added), 3, added)
-        self.assertEqual(len(removed), 3, removed)
-        self.assertEqual(added[0], f"\t{self.module} {self.version} // indirect")
-        self.assertRegex(added[1], rf"^{re.escape(self.module)} {re.escape(self.version)} h1:[A-Za-z0-9+/]{{43}}=$")
-        self.assertRegex(added[2], rf"^{re.escape(self.module)} {re.escape(self.version)}/go\.mod h1:[A-Za-z0-9+/]{{43}}=$")
-        for line in removed:
-            self.assertTrue(line.strip().startswith(self.module + " "), line)
-            self.assertNotIn(self.version, line)
-        self.assertEqual(re.findall(r"(?m)^diff --git a/(\S+) ", patch), ["go.mod", "go.sum"])
+    def test_the_recipe_is_at_or_above_the_release_the_cluster_requires(self):
+        self.assertGreaterEqual(upstream_watch.version(self.env["UPSTREAM_TAG"]), GRAFANA_FLOOR)
 
-    def test_the_build_refuses_a_server_without_the_patched_version(self):
+    def test_the_pins_name_the_13_3_2_release(self):
+        self.assertEqual(self.env["UPSTREAM_TAG"], "v13.3.2")
+        self.assertEqual(self.env["UPSTREAM_COMMIT"], "b8e90ef2a99c8629339e7233a7a813456d87c075")
+        self.assertEqual(self.env["UPSTREAM_BUILD_COMMIT"], "bd754986872f554d30a147ebd605a7fe15881a28")
+        self.assertEqual(self.env["UPSTREAM_BUILD_BRANCH"], "release-13.3.2#patched")
+        self.assertEqual(self.env["FC_REVISION"], "fc1")
+
+    def test_the_base_image_is_upstreams_image_of_that_tag_pinned_by_digest(self):
+        tag = self.env["UPSTREAM_TAG"][1:]
+        self.assertRegex(read("Dockerfile.grafana"),
+                         rf"(?m)^ARG GRAFANA_IMAGE=docker\.io/grafana/grafana:{re.escape(tag)}@sha256:[0-9a-f]{{64}}$")
+
+    def test_no_file_names_the_old_release(self):
+        for name in ("Dockerfile.grafana", "images/grafana.env", "README.md", "scripts/smoke-grafana.sh"):
+            with self.subTest(name=name):
+                self.assertNotIn("13.3.1", read(name))
+
+
+class UpstreamServerTest(unittest.TestCase):
+    def setUp(self):
+        self.env = upstream_watch.read_env(os.path.join(ROOT, "images", "grafana.env"))
+        self.module = self.env.get("UPSTREAM_FIXED_MODULE", "")
+        self.version = self.env.get("UPSTREAM_FIXED_VERSION", "")
+
+    def test_the_server_rebuild_and_its_patch_are_gone(self):
+        self.assertFalse(os.path.exists(os.path.join(ROOT, "patches", "grafana-server.patch")))
         text = read("Dockerfile.grafana")
-        stage = text.split("FROM go AS server", 1)[1].split("\nFROM ", 1)[0]
-        self.assertIn("COPY patches/grafana-server.patch", stage)
-        self.assertIn("git apply /tmp/deps.patch", stage)
-        self.assertIn('grep -qP "^\\tdep\\t${UPSTREAM_PATCH_MODULE}\\t${UPSTREAM_PATCH_VERSION}\\t" /tmp/buildinfo', stage)
-        self.assertIn("COPY --from=server /out/grafana ", text)
+        self.assertNotIn("grafana-server.patch", text)
+        self.assertNotIn("/tmp/grafana-server", text)
+        self.assertNotIn("/usr/share/grafana/bin/grafana;", text)
+        for key in ("UPSTREAM_PATCH_MODULE", "UPSTREAM_PATCH_VERSION", "UPSTREAM_FIX_COMMIT", "UPSTREAM_BUILD_STAMP"):
+            with self.subTest(key=key):
+                self.assertNotIn(key, self.env)
+                self.assertNotIn(key, text)
 
-    def test_the_build_is_told_the_module_and_version(self):
+    def test_the_fixed_module_is_at_or_above_the_version_that_cleared_the_scan(self):
+        self.assertEqual(self.module, FIXED_MODULE)
+        self.assertGreaterEqual(upstream_watch.version(self.version), FIXED_FLOOR)
+
+    def test_the_build_refuses_an_upstream_server_without_the_fix_or_of_another_build(self):
+        text = read("Dockerfile.grafana")
+        stage = text.split("FROM go AS server\n", 1)[1].split("\nFROM ", 1)[0]
+        self.assertIn("COPY --from=upstream /usr/share/grafana/bin/grafana /tmp/upstream", stage)
+        self.assertIn('test "$(head -n 1 /tmp/buildinfo)" = "/tmp/upstream: go${UPSTREAM_GO_VERSION}"', stage)
+        self.assertIn('grep -cP "^\\tdep\\t${UPSTREAM_FIXED_MODULE}\\t${UPSTREAM_FIXED_VERSION}\\t" /tmp/buildinfo '
+                      '| grep -qx 1', stage)
+        self.assertIn('grep -qxP "\\tpath\\tgithub.com/grafana/grafana/pkg/cmd/grafana" /tmp/buildinfo', stage)
+        self.assertIn("COPY --from=server /tmp/buildinfo /tmp/server-buildinfo", text)
+        rootfs = text.split("FROM upstream AS rootfs", 1)[1].split("\nFROM ", 1)[0]
+        self.assertIn('test "$(grafana server -v)" = "Version ${UPSTREAM_TAG#v} (commit: ${UPSTREAM_BUILD_COMMIT}, '
+                      'branch: ${UPSTREAM_BUILD_BRANCH})"', rootfs)
+        self.assertIn("/tmp/server-buildinfo", rootfs.split("    rm /tmp/vlogs.zip", 1)[1].split("\n", 1)[0])
+
+    def test_the_build_is_told_the_server_pins(self):
         build = read("scripts/build.sh")
-        for key in ("UPSTREAM_PATCH_MODULE", "UPSTREAM_PATCH_VERSION", "UPSTREAM_COMMIT", "UPSTREAM_BUILD_STAMP"):
-            self.assertIn(key, self.env)
-            self.assertRegex(build, rf"\b{key}\b")
+        for key in ("UPSTREAM_COMMIT", "UPSTREAM_BUILD_COMMIT", "UPSTREAM_BUILD_BRANCH", "UPSTREAM_GO_VERSION",
+                    "UPSTREAM_FIXED_MODULE", "UPSTREAM_FIXED_VERSION"):
+            with self.subTest(key=key):
+                self.assertIn(key, self.env)
+                self.assertRegex(build, rf"\b{key}\b")
 
     def test_the_smoke_test_checks_the_running_server(self):
         smoke = read("scripts/smoke-grafana.sh")
-        self.assertIn("server dep[[:space:]]+${UPSTREAM_PATCH_MODULE}[[:space:]]+${UPSTREAM_PATCH_VERSION}[[:space:]]", smoke)
-        self.assertIn("fc-${UPSTREAM_PATCH_MODULE##*/}-${UPSTREAM_PATCH_VERSION}", smoke)
+        self.assertIn("server ^/b/server: go$UPSTREAM_GO_VERSION\\$", smoke)
+        self.assertIn("server dep[[:space:]]+${UPSTREAM_FIXED_MODULE}[[:space:]]+${UPSTREAM_FIXED_VERSION}[[:space:]]",
+                      smoke)
+        self.assertIn('"Version ${UPSTREAM_TAG#v} (commit: ${UPSTREAM_BUILD_COMMIT}, branch: ${UPSTREAM_BUILD_BRANCH})"',
+                      smoke)
+        self.assertIn('is "$health" .commit "$UPSTREAM_BUILD_COMMIT"', smoke)
+        self.assertNotIn("UPSTREAM_PATCH", smoke)
 
     def test_every_rebuilt_binary_is_checked_against_the_pinned_go(self):
         text = read("Dockerfile.grafana")
         go = self.env["GO_VERSION"]
         self.assertRegex(text, rf"(?m)^ARG GO_IMAGE=docker\.io/library/golang:{re.escape(go)}@sha256:[0-9a-f]{{64}}$")
         self.assertIn('RUN --network=none test "$(go env GOVERSION)" = "go${GO_VERSION}"', text)
-        for stage, binary in (("server", "/out/grafana"), ("jaeger", "/out/backend"), ("vlogs", "/out/backend")):
+        for stage in ("jaeger", "vlogs"):
             with self.subTest(stage=stage):
                 body = text.split(f"FROM go AS {stage}\n", 1)[1].split("\nFROM ", 1)[0]
                 self.assertRegex(body, r"(?m)^ARG .*\bGO_VERSION\b|^    .*\bGO_VERSION\b")
-                self.assertIn(f'test "$(head -n 1 /tmp/buildinfo)" = "{binary}: go${{GO_VERSION}}"', body)
-        self.assertGreaterEqual(tuple(int(x) for x in go.split(".")),
-                                tuple(int(x) for x in self.env["UPSTREAM_GO_VERSION"].split(".")))
+                self.assertIn('test "$(head -n 1 /tmp/buildinfo)" = "/out/backend: go${GO_VERSION}"', body)
+        # upstream's server is not rebuilt, so its Go must be no older than the one the backends get.
+        self.assertGreaterEqual(tuple(int(x) for x in self.env["UPSTREAM_GO_VERSION"].split(".")),
+                                tuple(int(x) for x in go.split(".")))
 
+
+class HardeningTest(unittest.TestCase):
     def test_the_image_defaults_point_every_grafana_com_address_at_loopback(self):
         text = read("Dockerfile.grafana")
         for line in ("GF_GRAFANA_COM_URL=http://127.0.0.1:9 \\", "GF_GRAFANA_COM_API_URL=http://127.0.0.1:9/api \\",
@@ -151,10 +199,39 @@ class ServerRebuildTest(unittest.TestCase):
         self.assertIn("check entrypoint ", smoke)
         self.assertIn("readOnlyRootFilesystem", read("README.md"))
 
-    def test_the_readme_says_when_to_drop_the_rebuild(self):
+    def test_the_readme_says_the_server_is_upstreams_and_what_the_build_checks(self):
         readme = " ".join(read("README.md").split())
-        self.assertIn(f"`{self.module}` {self.version}", readme)
-        self.assertIn("Drop the server rebuild", readme)
+        env = upstream_watch.read_env(os.path.join(ROOT, "images", "grafana.env"))
+        self.assertIn("UPSTREAM_FIXED_MODULE", env)
+        self.assertIn(f"`{env['UPSTREAM_FIXED_MODULE']}` {env['UPSTREAM_FIXED_VERSION']}", readme)
+        self.assertIn("upstream's binary, unchanged", readme)
+        self.assertNotIn("Drop the server rebuild", readme)
+
+    def test_the_readme_says_upstreams_server_is_a_private_build_that_lacks_two_public_tag_commits(self):
+        readme = " ".join(read("README.md").split())
+        self.assertIn("| Grafana server | release build bd75498687 (tag v13.3.2, b8e90ef2a9):", readme)
+        self.assertNotIn("Up to the 13.3 release before it", readme)
+        limits = readme.split("## Grafana", 1)[1].split("## Tailscale", 1)[0].split("Known limits:", 1)[1]
+        for needle in ("not a build of the public tag", "#138361", "#138800", "both security patches",
+                       "`com.figurecollecting.upstream.commit`"):
+            with self.subTest(needle=needle):
+                self.assertIn(needle, limits)
+
+    def test_the_readme_says_the_missing_seeder_lock_retry_can_stop_a_start(self):
+        readme = " ".join(read("README.md").split())
+        limits = readme.split("## Grafana", 1)[1].split("## Tailscale", 1)[0].split("Known limits:", 1)[1]
+        self.assertNotIn("Neither missing commit touches what the viewer uses", readme)
+        for needle in ("#138800 is in the Azure Monitor data source, which the viewer does not use",
+                       "#138361 runs at every start",
+                       "there is already a lock for this actionName: oss-ac-basic-role-seeder",
+                       "once the lock is 2 minutes old"):
+            with self.subTest(needle=needle):
+                self.assertIn(needle, limits)
+
+    def test_the_header_does_not_call_upstreams_grafana_files_root_owned(self):
+        header = " ".join(line.lstrip("# ") for line in read("Dockerfile.grafana").split("\nARG ", 1)[0].splitlines())
+        self.assertNotIn("everything else outside the data, log and temp paths root-owned", header)
+        self.assertIn("1000:1000", header)
 
 
 if __name__ == "__main__":

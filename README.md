@@ -36,8 +36,8 @@ UI assets match it.
 
 ## Grafana
 
-`Dockerfile.grafana` starts from upstream's Grafana OSS image, pinned by digest, and changes seven things
-(the seventh, the server rebuild, is described under the table):
+`Dockerfile.grafana` starts from upstream's Grafana OSS image, pinned by digest, and changes six things
+(the server is upstream's binary, unchanged; see under the table):
 
 - `victoriametrics-logs-datasource` is baked in from its release zip (pinned version, sha256-verified)
   into `/usr/share/grafana/plugins`.
@@ -67,29 +67,24 @@ UI assets match it.
 
 | Component | Upstream | Ours |
 |---|---|---|
-| Grafana server | v13.3.1 (5db6ba8876): Go 1.27.3, thrift v0.24.0 | Go 1.27.4, thrift v0.25.0 (upstream f9eeaa2a on release-13.3.2); frontend and the rest unchanged, non-root as upstream (uid 472) |
+| Grafana server | release build bd75498687 (tag v13.3.2, b8e90ef2a9): Go 1.27.4, thrift v0.25.0 | upstream's binary, unchanged; frontend and the rest unchanged, non-root as upstream (uid 472) |
 | victoriametrics-logs-datasource | v0.34.0 (a5450dee43): Go 1.27.2, x/net v0.60.0, compress v1.19.2 | Go 1.27.4, x/net v0.62.0, compress v1.20.4 (upstream 2d682142, 12c4778f on main) |
 | Jaeger data source | v13.0.8 (7bf6c164d5): Go 1.27.3, x/net v0.61.0 | Go 1.27.4, x/net v0.62.0 (upstream cb0d47d1 on main) |
 | zlib (Alpine 3.24) | 1.3.2-r1 | 1.4-r0 |
 | libcrypto3 (Alpine 3.24) | 3.5.9-r0 | 3.5.9-r1 |
 | libssl3 (Alpine 3.24) | 3.5.9-r0 | 3.5.9-r1 |
 
-Grafana's own server binary is rebuilt too. Upstream's v13.3.1 binary carries
-`github.com/apache/thrift` v0.24.0, which the scan gate reports. The server is built from the public
-v13.3.1 tag with one source change, `github.com/apache/thrift` v0.25.0 (`patches/grafana-server.patch`),
-with upstream's build settings and Go 1.27.4, and replaces the binary in upstream's image. The build
-fails unless the result is built by that Go, from the same modules, at the same versions, as upstream's
-binary apart from that one.
-`grafana server -v` reports `Version 13.3.1 (commit: <the tag's commit>, branch: v13.3.1-fc-thrift-v0.25.0)`.
-Upstream's published binary reports a commit that is not in the public repository
-(`branch: release-13.3.1#patched`). The public tag is the same source: built unpatched with Go 1.27.3
-and upstream's own version stamps, it is byte-identical to upstream's binary (checked 2026-11-18), and
-its release commit names the security patches it applies.
+Grafana's own server binary is upstream's binary, unchanged. 13.3.2 fixes CVE-2026-107561 and
+CVE-2026-88960 in the server's own code, and its release commit names the two security patches. Before
+13.3.2 the server was rebuilt here, only to move `github.com/apache/thrift` to v0.25.0, which 13.3.2
+ships. The build fails unless upstream's binary was built by Go 1.27.4 from Grafana's server package
+with `github.com/apache/thrift` v0.25.0 (not replaced), and reports
+`Version 13.3.2 (commit: bd75498687, branch: release-13.3.2#patched)`. Upstream builds its release
+binaries from that private branch; the public tag's commit is b8e90ef2a9, and the two differ (see
+Known limits).
 
-Drop the server rebuild when the recipe moves to a Grafana release, 13.3.2 or later, that ships thrift
-v0.25.0 or later: delete the `server` stage and `patches/grafana-server.patch`. The weekly
-`upstream-watch` reads the new release's `go.mod` and says whether to drop or keep it. It also reports
-Grafana's out-of-band security releases (`v13.3.1+security-01`) as newer than their base.
+The weekly `upstream-watch` reports a newer Grafana release, including Grafana's out-of-band security
+releases (`v13.3.2+security-01`), which are newer than their base.
 
 Go back to a plugin's own signed backend when its upstream releases one with the fixes.
 
@@ -137,10 +132,23 @@ their purpose and no default covers it. Git Sync is the exception, and it is off
 
 With these defaults the server made no DNS query and no outbound connection in a run that called the
 avatar, grafana.com proxy, plugin install, external snapshot, Cloud Migration and Git Sync endpoints as
-admin and then opened 54 pages of the UI in a browser (checked 2026-11-19 on the built image).
+admin and then opened 54 pages of the UI in a browser (checked 2026-11-19 on the image of the previous Grafana release; not repeated for 13.3.2, whose
+outbound settings are the same).
 
 Known limits:
 
+- Upstream's 13.3.2 server binary is not a build of the public tag. Rebuilt from tag b8e90ef2a9 with
+  Go 1.27.4 and upstream's four version stamps, the server has the same `go version -m` output but not
+  the same bytes: 5 symbols exist only in the tag build. They come from two public non-security commits
+  that upstream's binary lacks, #138361 (retry of the basic-role seeder lock) and #138800 (Azure
+  Monitor multi-resource fan-out). Upstream's binary carries both security patches (checked 2026-11-25
+  by symbols and strings). #138800 is in the Azure Monitor data source, which the viewer does not use.
+  #138361 runs at every start: if a start is killed while it seeds basic roles, each start in the next
+  2 minutes exits with "there is already a lock for this actionName: oss-ac-basic-role-seeder", where
+  the tag's build waits for the lock (checked 2026-11-25). Kubernetes restarts the pod, and it starts
+  once the lock is 2 minutes old. The image label
+  `com.figurecollecting.upstream.commit` names the tag commit, not the build commit bd75498687, which
+  is not in the public repository.
 - The operator's browser still fetches from third parties in at least three cases, all upstream
   behaviour. The VictoriaLogs plugin's page (`/plugins/victoriametrics-logs-datasource`) shows its
   README, whose 20 images load from github.com. Upstream's frontend bundles FingerprintJS, which
@@ -164,11 +172,9 @@ Known limits:
 - The `zlib`, `libcrypto3` and `libssl3` pins are files on Alpine's CDN, which keeps only the current package
   version. When Alpine supersedes 1.4-r0 (or 3.5.9-r1) the URL returns 404 and the Grafana build fails until it is re-pinned. Nothing
   watches for that.
-- A clean Grafana build left about 17.7 GB of BuildKit state in one local measurement, and the
-  scanners need about 5 GB of databases. CI ran the `grafana` leg on the GitHub runner at `a3daa23`
-  and it passed (scan gate, smoke 52/52). The leg takes about 10 minutes.
-- The upstream watch reads only the `require` lines of the new release's root `go.mod`. A `replace`
-  of thrift back to an older version would still read as "drop".
+- A clean Grafana build that still rebuilt the server left about 17.7 GB of BuildKit state in one local
+  measurement, and the scanners need about 5 GB of databases. CI ran the `grafana` leg on the GitHub
+  runner at `a3daa23` and it passed (scan gate, smoke 52/52). The leg took about 10 minutes.
 - A `+security-NN` release cannot be the image tag as written, because `+` is not allowed in one.
 - The Prometheus, Loki, Tempo and other bundled data sources are absent. Grafana logs two errors at
   start about the missing Prometheus plugin.

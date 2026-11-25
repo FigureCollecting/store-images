@@ -119,10 +119,12 @@ class WatchTest(unittest.TestCase):
         self.assertEqual(self.gomod_calls, [])
         self.assertNotIn("server rebuild", out)
 
-    def test_the_grafana_definition_in_this_repository_names_the_patched_module(self):
+    def test_the_grafana_definition_in_this_repository_has_no_server_rebuild_to_drop(self):
+        # 13.3.2 ships thrift v0.25.0 itself, so the recipe uses upstream's server and the watch gives no advice.
         env = upstream_watch.read_env(os.path.join(os.path.dirname(__file__), "..", "images", "grafana.env"))
-        self.assertEqual(env.get("UPSTREAM_PATCH_MODULE"), "github.com/apache/thrift")
-        self.assertGreaterEqual(upstream_watch.version(env.get("UPSTREAM_PATCH_VERSION")), (0, 25, 0))
+        self.assertNotIn("UPSTREAM_PATCH_MODULE", env)
+        self.assertNotIn("UPSTREAM_PATCH_VERSION", env)
+        self.assertEqual(env.get("UPSTREAM_FIXED_MODULE"), "github.com/apache/thrift")
 
     def test_no_newer_release_passes(self):
         self.images(victoria_logs=VL, victoria_traces=VT)
