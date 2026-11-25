@@ -11,8 +11,8 @@
 #   - Alpine's zlib, libcrypto3 and libssl3 moved to the fixed packages (pinned files, sha256-verified);
 #   - telemetry, update checks, the news feed, the plugin catalog, run-time plugin installs and Grafana
 #     Cloud Migration off by default;
-#   - the entrypoint and everything else outside the data, log and temp paths root-owned and read-only
-#     for the Grafana user.
+#   - the entrypoint root-owned, and everything outside the data, log and temp paths read-only for the
+#     Grafana user (upstream's files under /usr/share/grafana stay 1000:1000, which it is neither).
 # Build arguments come from images/grafana.env via scripts/build.sh; target = grafana.
 # Every RUN has no network, except the four that fetch a pinned source tree or its go.sum-verified modules.
 ARG GRAFANA_IMAGE=docker.io/grafana/grafana:13.3.2@sha256:81556409ba48b2b922e0adb69a2511337d8ba7578f11962eefa6149a2d815101

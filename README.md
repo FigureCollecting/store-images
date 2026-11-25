@@ -67,7 +67,7 @@ UI assets match it.
 
 | Component | Upstream | Ours |
 |---|---|---|
-| Grafana server | v13.3.2 (b8e90ef2a9): Go 1.27.4, thrift v0.25.0 | upstream's binary, unchanged; frontend and the rest unchanged, non-root as upstream (uid 472) |
+| Grafana server | release build bd75498687 (tag v13.3.2, b8e90ef2a9): Go 1.27.4, thrift v0.25.0 | upstream's binary, unchanged; frontend and the rest unchanged, non-root as upstream (uid 472) |
 | victoriametrics-logs-datasource | v0.34.0 (a5450dee43): Go 1.27.2, x/net v0.60.0, compress v1.19.2 | Go 1.27.4, x/net v0.62.0, compress v1.20.4 (upstream 2d682142, 12c4778f on main) |
 | Jaeger data source | v13.0.8 (7bf6c164d5): Go 1.27.3, x/net v0.61.0 | Go 1.27.4, x/net v0.62.0 (upstream cb0d47d1 on main) |
 | zlib (Alpine 3.24) | 1.3.2-r1 | 1.4-r0 |
@@ -75,12 +75,13 @@ UI assets match it.
 | libssl3 (Alpine 3.24) | 3.5.9-r0 | 3.5.9-r1 |
 
 Grafana's own server binary is upstream's binary, unchanged. 13.3.2 fixes CVE-2026-107561 and
-CVE-2026-88960 in the server's own code, and its release commit names the two security patches. Up to
-the 13.3 release before it, the server was rebuilt here only to move `github.com/apache/thrift` to
-v0.25.0, which 13.3.2 ships. The build fails unless upstream's binary was built by Go 1.27.4 from
-Grafana's server package with `github.com/apache/thrift` v0.25.0 (not replaced), and reports
+CVE-2026-88960 in the server's own code, and its release commit names the two security patches. Before
+13.3.2 the server was rebuilt here, only to move `github.com/apache/thrift` to v0.25.0, which 13.3.2
+ships. The build fails unless upstream's binary was built by Go 1.27.4 from Grafana's server package
+with `github.com/apache/thrift` v0.25.0 (not replaced), and reports
 `Version 13.3.2 (commit: bd75498687, branch: release-13.3.2#patched)`. Upstream builds its release
-binaries from that private branch; the public tag's commit is b8e90ef2a9.
+binaries from that private branch; the public tag's commit is b8e90ef2a9, and the two differ (see
+Known limits).
 
 The weekly `upstream-watch` reports a newer Grafana release, including Grafana's out-of-band security
 releases (`v13.3.2+security-01`), which are newer than their base.
@@ -136,6 +137,14 @@ outbound settings are the same).
 
 Known limits:
 
+- Upstream's 13.3.2 server binary is not a build of the public tag. Rebuilt from tag b8e90ef2a9 with
+  Go 1.27.4 and upstream's four version stamps, the server has the same `go version -m` output but not
+  the same bytes: 5 symbols exist only in the tag build. They come from two public non-security commits
+  that upstream's binary lacks, #138361 (retry of the basic-role seeder lock) and #138800 (Azure
+  Monitor multi-resource fan-out). Upstream's binary carries both security patches (checked 2026-11-25
+  by symbols and strings). Neither missing commit touches what the viewer uses. The image label
+  `com.figurecollecting.upstream.commit` names the tag commit, not the build commit bd75498687, which
+  is not in the public repository.
 - The operator's browser still fetches from third parties in at least three cases, all upstream
   behaviour. The VictoriaLogs plugin's page (`/plugins/victoriametrics-logs-datasource`) shows its
   README, whose 20 images load from github.com. Upstream's frontend bundles FingerprintJS, which

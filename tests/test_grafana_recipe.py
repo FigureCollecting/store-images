@@ -207,6 +207,21 @@ class HardeningTest(unittest.TestCase):
         self.assertIn("upstream's binary, unchanged", readme)
         self.assertNotIn("Drop the server rebuild", readme)
 
+    def test_the_readme_says_upstreams_server_is_a_private_build_that_lacks_two_public_tag_commits(self):
+        readme = " ".join(read("README.md").split())
+        self.assertIn("| Grafana server | release build bd75498687 (tag v13.3.2, b8e90ef2a9):", readme)
+        self.assertNotIn("Up to the 13.3 release before it", readme)
+        limits = readme.split("## Grafana", 1)[1].split("## Tailscale", 1)[0].split("Known limits:", 1)[1]
+        for needle in ("not a build of the public tag", "#138361", "#138800", "both security patches",
+                       "`com.figurecollecting.upstream.commit`"):
+            with self.subTest(needle=needle):
+                self.assertIn(needle, limits)
+
+    def test_the_header_does_not_call_upstreams_grafana_files_root_owned(self):
+        header = " ".join(line.lstrip("# ") for line in read("Dockerfile.grafana").split("\nARG ", 1)[0].splitlines())
+        self.assertNotIn("everything else outside the data, log and temp paths root-owned", header)
+        self.assertIn("1000:1000", header)
+
 
 if __name__ == "__main__":
     unittest.main()
