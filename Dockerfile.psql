@@ -1,0 +1,33 @@
+# psql: Alpine 3.24.4, pinned by digest, with every package moved to the newest in the release's repositories
+# (`apk upgrade`) and the PostgreSQL 17 client (psql, pg_isready, pg_dump and their library) at PGCLIENT_VERSION.
+# It replaces postgres:17-alpine in the Jobs that run only the client. There is no server, no gosu and no user:
+# a deployment sets a numeric one, as it does for postgres:17-alpine. The Jobs run `sh` (busybox ash), which is
+# Alpine's own; the image has no bash.
+# The whole file system is one layer, so the old packages are in no layer.
+# The build is not reproducible byte for byte: `apk upgrade` answers with what is current. What it produced is what
+# scripts/scan.sh scans and scripts/smoke-psql.sh runs before anything is published.
+# Build arguments come from images/psql.env via scripts/build.sh; target = psql.
+ARG UPSTREAM_IMAGE=docker.io/library/alpine:3.24.4@sha256:f59abe656b692d901e184be3445e084786602108599d2a51d229c0f5a48c71bf
+
+FROM ${UPSTREAM_IMAGE} AS rootfs
+ARG PGCLIENT_VERSION
+RUN apk upgrade --no-cache \
+ && apk add --no-cache "postgresql17-client=${PGCLIENT_VERSION}" \
+ && test "$(psql --version)" = "psql (PostgreSQL) ${PGCLIENT_VERSION%-r*}" \
+ && pg_isready --version >/dev/null \
+ && rm -rf /var/cache/apk/*
+
+FROM scratch AS psql
+ARG UPSTREAM_IMAGE UPSTREAM_TAG PGCLIENT_VERSION FC_REVISION FC_COMMIT CREATED
+COPY --from=rootfs / /
+ENV PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+LABEL org.opencontainers.image.source="https://github.com/FigureCollecting/store-images" \
+      org.opencontainers.image.revision="${FC_COMMIT}" \
+      org.opencontainers.image.version="${UPSTREAM_TAG}-${FC_REVISION}" \
+      org.opencontainers.image.created="${CREATED}" \
+      org.opencontainers.image.base.name="${UPSTREAM_IMAGE}" \
+      org.opencontainers.image.licenses="PostgreSQL" \
+      com.figurecollecting.upstream.tag="${UPSTREAM_TAG}" \
+      com.figurecollecting.postgresql17-client.package="${PGCLIENT_VERSION}"
+WORKDIR /
+CMD ["/bin/sh"]

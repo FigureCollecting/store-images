@@ -6,7 +6,8 @@ name: upstream-watch
 # check its image's scan, re-pin the store and bump the watch tag (the rebuild stays). For Grafana, a newer release
 # of Grafana, of the VictoriaLogs data source or of the Jaeger data source is the signal to re-pin the recipe and
 # rebuild. For Tailscale, to scan upstream's image of the release and, if it passes the gate, re-pin consumers to it
-# and delete the Tailscale recipe. Opens nothing, writes nothing.
+# and delete the Tailscale recipe; the same for the node-npm and valkey wrappers (psql has no release feed: its
+# definition's note is printed). Opens nothing, writes nothing.
 on:
   schedule:
     - cron: "17 13 * * 1"

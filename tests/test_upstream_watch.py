@@ -15,7 +15,13 @@ GF = ("APP_NAME=grafana\nUPSTREAM_REPO=https://github.com/grafana/grafana\nUPSTR
       "VLOGS_DS_REPO=https://github.com/VictoriaMetrics/victorialogs-datasource\nVLOGS_DS_TAG=v0.34.0\n"
       "JAEGER_DS_REPO=https://github.com/grafana/grafana-jaeger-datasource\nJAEGER_DS_TAG=v13.0.8\n")
 TS = "APP_NAME=tailscale\nUPSTREAM_REPO=https://github.com/tailscale/tailscale\nUPSTREAM_TAG=v1.104.7\nWATCH_ACTION=retire\n"
-PATCHED = "UPSTREAM_PATCH_MODULE=github.com/apache/thrift\nUPSTREAM_PATCH_VERSION=v0.25.0\n"
+NODE = ("APP_NAME=node-npm\nUPSTREAM_REPO=https://github.com/nodejs/node\nUPSTREAM_TAG=v24.22.3\n"
+        "UPSTREAM_TAG_PREFIX=v24.\nWATCH_ACTION=retire\n")
+VK = ("APP_NAME=valkey\nUPSTREAM_REPO=https://github.com/valkey-io/valkey\nUPSTREAM_TAG=9.1.4\n"
+      "UPSTREAM_TAG_PREFIX=9.1.\nWATCH_ACTION=retire\n")
+PSQL = ("APP_NAME=psql\nUPSTREAM_TAG=17.12\nWATCH_ACTION=retire\n"
+        "WATCH_NOTE=retire when postgres:17-alpine passes the scan gate\n")
+PATCHED ="UPSTREAM_PATCH_MODULE=github.com/apache/thrift\nUPSTREAM_PATCH_VERSION=v0.25.0\n"
 GOMOD = ("module github.com/grafana/grafana\n\ngo 1.27.4\n\nrequire (\n"
          "\tgithub.com/apache/thrift-extra v9.9.9\n"
          "\tgithub.com/apache/thrift v0.24.0 // indirect\n"
@@ -333,6 +339,67 @@ class WatchTest(unittest.TestCase):
         rc, out = self.run_watch({})
         self.assertEqual(rc, 2)
         self.assertIn("no image definitions", out)
+
+    def test_a_tag_prefix_keeps_the_watch_on_one_release_line(self):
+        # nodejs/node publishes 22.x, 24.x and 26.x releases side by side; only the base's line is a newer release.
+        self.images(node_npm=NODE)
+        rc, out = self.run_watch({"nodejs/node": [rel("v26.13.1"), rel("v24.22.3"), rel("v22.23.5")]})
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(out, "node-npm: base v24.22.3, newest upstream release v24.22.3: no newer release\n")
+        rc, out = self.run_watch({"nodejs/node": [rel("v26.13.1"), rel("v24.22.4"), rel("v24.22.3")]})
+        self.assertEqual(rc, 1)
+        self.assertIn("::error title=Upstream released node-npm v24.22.4::node-npm: base v24.22.3, upstream "
+                      "released v24.22.4. Run scripts/scan.sh on upstream's image of it.", out)
+        rc, out = self.run_watch({"nodejs/node": [rel("v26.13.1")]})
+        self.assertEqual(rc, 2)
+        self.assertIn("::error title=Upstream watch failed::node-npm: no stable release found in nodejs/node "
+                      "with the tag prefix v24.\n", out)
+
+    def test_a_bare_tag_prefix_reads_tags_without_the_v(self):
+        # valkey-io/valkey tags are 9.1.4, not v9.1.4; a digit prefix says so. 9.1.10 is newer than 9.1.9.
+        self.images(valkey=VK)
+        rc, out = self.run_watch({"valkey-io/valkey": [rel("9.2.1"), rel("9.1.4"), rel("9.2.0-rc2", prerelease=True)]})
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(out, "valkey: base 9.1.4, newest upstream release 9.1.4: no newer release\n")
+        rc, out = self.run_watch({"valkey-io/valkey": [rel("9.1.10"), rel("9.1.9"), rel("9.1.4")]})
+        self.assertEqual(rc, 1)
+        self.assertIn("::error title=Upstream released valkey 9.1.10::valkey: base 9.1.4, upstream released 9.1.10.",
+                      out)
+
+    def test_a_bare_prefix_ignores_tags_that_are_not_bare_releases(self):
+        self.images(valkey=VK)
+        rc, out = self.run_watch({"valkey-io/valkey": [rel("9.1.4"), rel("v9.1.9"), rel("9.1.5-rc1"), rel("9.1")]})
+        self.assertEqual(rc, 0, out)
+
+    def test_a_definition_with_a_note_and_no_repository_prints_the_note_and_passes(self):
+        # psql has no upstream release feed (PostgreSQL and Alpine publish no GitHub releases).
+        self.images(psql=PSQL)
+        rc, out = self.run_watch({})
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(out, "psql: no upstream release feed to watch; retire when postgres:17-alpine passes the "
+                              "scan gate\n")
+        self.assertEqual(self.calls, [])
+
+    def test_a_definition_with_neither_repository_nor_note_is_still_an_error(self):
+        self.images(psql=PSQL.replace("WATCH_NOTE=", "NOTE="))
+        rc, out = self.run_watch({})
+        self.assertEqual(rc, 2)
+        self.assertIn("psql: UPSTREAM_REPO is not a github.com repository", out)
+
+    def test_the_wrapper_definitions_in_this_repository_are_watched_or_noted(self):
+        here = os.path.join(os.path.dirname(__file__), "..", "images")
+        for name, repo in (("node-npm", "https://github.com/nodejs/node"),
+                           ("valkey", "https://github.com/valkey-io/valkey")):
+            with self.subTest(name=name):
+                env = upstream_watch.read_env(os.path.join(here, f"{name}.env"))
+                self.assertEqual(env["WATCH_ACTION"], "retire")
+                self.assertEqual(env["UPSTREAM_REPO"], repo)
+                self.assertTrue(env["UPSTREAM_TAG"].startswith(env["UPSTREAM_TAG_PREFIX"]))
+                self.assertIsNotNone(upstream_watch.version(env["UPSTREAM_TAG"], env["UPSTREAM_TAG_PREFIX"]))
+        env = upstream_watch.read_env(os.path.join(here, "psql.env"))
+        self.assertEqual(env["WATCH_ACTION"], "retire")
+        self.assertTrue(env["WATCH_NOTE"])
+        self.assertNotIn("UPSTREAM_REPO", env)
 
 
 class FetchTest(unittest.TestCase):

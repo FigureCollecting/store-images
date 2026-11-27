@@ -42,7 +42,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        app: [victoria-traces, grafana, tailscale]
+        app: [victoria-traces, grafana, tailscale, node-npm, psql, valkey]
     env:
       APP: ${{ matrix.app }}
     steps:
@@ -70,7 +70,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        app: [victoria-traces, grafana, tailscale]
+        app: [victoria-traces, grafana, tailscale, node-npm, psql, valkey]
     env:
       APP: ${{ matrix.app }}
     steps:

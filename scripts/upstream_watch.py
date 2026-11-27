@@ -5,6 +5,9 @@ For every images/*.env (images we build) and watch/*.env (images we only watch):
 repository's GitHub releases, ignore drafts, pre-releases and tags that are not vX.Y.Z or
 vX.Y.Z+security-NN, and compare the newest with UPSTREAM_TAG. Every other <KEY>_REPO / <KEY>_TAG pair
 of the definition (a component baked into the image) is checked the same way.
+A definition may set <KEY>_TAG_PREFIX (v24. keeps nodejs/node on its 24.x line; a prefix that starts with a digit,
+9.1., reads bare X.Y.Z tags as valkey's) or, with no UPSTREAM_REPO, a WATCH_NOTE for an image whose upstream
+publishes no GitHub releases (printed, never a failure).
 Exit 1 if any image has a newer upstream release, 2 if a check could not be made, 0 otherwise.
 For an images/ entry a newer release is the signal to re-pin consumers to upstream's own image and
 archive this repository, or, for a definition with WATCH_ACTION=rebuild, to re-pin the recipe and
@@ -25,6 +28,7 @@ import urllib.request
 
 # vX.Y.Z, or Grafana's out-of-band security release of it, vX.Y.Z+security-NN (newer than vX.Y.Z itself).
 SEMVER = re.compile(r"^v(\d+)\.(\d+)\.(\d+)(?:\+security-(\d+))?$")
+BARE = re.compile(r"^(\d+)\.(\d+)\.(\d+)$")
 GITHUB = re.compile(r"^https://github\.com/([\w.-]+/[\w.-]+?)(?:\.git)?$")
 # What a newer release asks for, chosen by WATCH_ACTION in the definition (default: archive).
 ACTIONS = {
@@ -61,19 +65,26 @@ def read_env(path):
             raw = raw.strip()
             if raw and not raw.startswith("#") and "=" in raw:
                 key, value = raw.split("=", 1)
-                values[key] = value
+                # scripts/build.sh sources these files as shell, so a value with spaces is double-quoted.
+                values[key] = value[1:-1] if len(value) > 1 and value[0] == value[-1] == '"' else value
     return values
 
 
-def version(tag):
-    """(major, minor, patch, security) of vX.Y.Z or vX.Y.Z+security-NN, else None. Plain vX.Y.Z is security 0."""
-    m = SEMVER.match(tag or "")
-    return tuple(int(x or 0) for x in m.groups()) if m else None
+def version(tag, prefix=""):
+    """(major, minor, patch, security) of vX.Y.Z or vX.Y.Z+security-NN, else None. Plain vX.Y.Z is security 0.
+
+    A definition's <KEY>_TAG_PREFIX keeps the watch on one release line (a tag must start with it); a prefix that
+    starts with a digit says the upstream's tags are bare, X.Y.Z, as valkey's are."""
+    tag = tag or ""
+    if prefix and not tag.startswith(prefix):
+        return None
+    m = (BARE if prefix[:1].isdigit() else SEMVER).match(tag)
+    return tuple(int(x or 0) for x in m.groups()) + (0,) * (4 - len(m.groups())) if m else None
 
 
-def newest_stable(releases):
+def newest_stable(releases, prefix=""):
     tags = [r.get("tag_name") for r in releases if not r.get("draft") and not r.get("prerelease")]
-    return max((t for t in tags if version(t)), key=version, default=None)
+    return max((t for t in tags if version(t, prefix)), key=lambda t: version(t, prefix), default=None)
 
 
 def watched(env):
@@ -99,19 +110,24 @@ def check(name, env, fetch, key="UPSTREAM", read_gomod=None, rebuilt=None):
     rebuilt is None for an image we build; for a watch-only image it names the images we build.
     """
     label = name if key == "UPSTREAM" else f"{name} {key}"
+    if key == "UPSTREAM" and "UPSTREAM_REPO" not in env and env.get("WATCH_NOTE"):
+        # An image with no upstream release feed (psql: neither PostgreSQL nor Alpine publishes GitHub releases).
+        return 0, f"{label}: no upstream release feed to watch; {env['WATCH_NOTE']}"
     repo = GITHUB.match(env.get(f"{key}_REPO", ""))
     if not repo:
         return 2, f"{label}: {key}_REPO is not a github.com repository"
     base = env.get(f"{key}_TAG", "")
-    if not version(base):
-        return 2, f"{label}: {key}_TAG '{base}' is not vX.Y.Z"
+    prefix = env.get(f"{key}_TAG_PREFIX", "")
+    if not version(base, prefix):
+        return 2, f"{label}: {key}_TAG '{base}' is not vX.Y.Z" + (f" with the tag prefix {prefix}" if prefix else "")
     try:
-        newest = newest_stable(fetch(repo.group(1)))
+        newest = newest_stable(fetch(repo.group(1)), prefix)
     except (OSError, ValueError) as exc:
         return 2, f"{label}: {exc}"
     if newest is None:
-        return 2, f"{label}: no stable release found in {repo.group(1)}"
-    if version(newest) > version(base):
+        return 2, f"{label}: no stable release found in {repo.group(1)}" + (
+            f" with the tag prefix {prefix}" if prefix else "")
+    if version(newest, prefix) > version(base, prefix):
         action = env.get("WATCH_ACTION", "archive")
         if rebuilt is not None:
             step = (f"{name} is watch-only: check its image's scan, re-pin the store, then bump UPSTREAM_TAG in "
