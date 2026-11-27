@@ -2,7 +2,8 @@
 #   - every Alpine package moved to the newest in the release's repositories (`apk upgrade`);
 #   - npm moved to NPM_VERSION (npm install --global), the build failing unless every brace-expansion bundled in that
 #     npm is at least BRACE_EXPANSION_MIN;
-#   - corepack removed (its bundled undici is what the scan gate flags; nothing here runs yarn or pnpm through it).
+#   - corepack removed (nothing here runs yarn or pnpm through it; the smoke enforces the removal, the scan gate does not).
+#     The npm move is what clears the gate's findings (brace-expansion, and undici 6.28.0 inside the old npm).
 # Everything else is upstream's files and settings: the same entrypoint and command, no user (a deployment sets one),
 # node and yarn as upstream built them. The whole file system is one layer, so the replaced npm, the removed corepack
 # and the old packages are in no layer.

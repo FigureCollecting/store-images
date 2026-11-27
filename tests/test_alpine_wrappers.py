@@ -16,7 +16,7 @@ ROOT = os.path.join(os.path.dirname(__file__), "..")
 # FC_REVISIONs already published to ghcr.io/figurecollecting/<app>; a tag is never overwritten, so a change to what an
 # image holds needs a revision not in its list. Nothing is published yet.
 PUBLISHED_REVISIONS = {"node-npm": (), "psql": (), "valkey": ()}
-# The lowest versions that clear the findings of the scan gate on 2026-11-25 (docs/README: "What is wrapped").
+# The lowest versions that clear the findings of the scan gate on 2026-11-25 (README: "Alpine wrappers").
 NPM_FLOOR = (11, 21, 3)
 BRACE_EXPANSION_FLOOR = (5, 0, 11)
 PGCLIENT_FIXED = "17.12-r0"
@@ -163,6 +163,13 @@ class NodeNpmTest(WrapperTest):
         for want in ("NODE_VERSION=24.22.3", "YARN_VERSION=1.22.22", "PATH=/usr/local/sbin:/usr/local/bin:"):
             self.assertIn(want, envs)
 
+    def test_no_text_blames_corepack_for_undici_6_28_0(self):
+        # undici 6.28.0 is in npm 11.19.1's own node_modules; corepack contains no undici.
+        for path in ("Dockerfile.node-npm", "images/node-npm.env", "README.md"):
+            with self.subTest(path=path):
+                text = " ".join(read(path).replace("\n#", " ").split())
+                self.assertNotRegex(text, r"(?i)corepack[^.;]{0,80}undici|undici[^.;]{0,80}corepack|corepack[^.;]{0,30}bundl")
+
     def test_the_smoke_checks_node_npm_brace_expansion_and_that_corepack_is_gone(self):
         smoke = read("scripts/smoke-node-npm.sh")
         for want in ("node --version", "npm --version", "brace-expansion", "corepack", "BRACE_EXPANSION_MIN"):
@@ -188,6 +195,10 @@ class PsqlTest(WrapperTest):
     def test_the_settings_are_alpines_and_there_is_no_user(self):
         self.assertIn(("CMD", '["/bin/sh"]'), self.final)
         self.assertNotIn("ENTRYPOINT", [k for k, _ in self.final])
+
+    def test_the_smoke_tool_list_has_mkfifo_which_migrate_sh_needs(self):
+        tools = next(l for l in read("scripts/smoke-psql.sh").splitlines() if l.startswith("tools="))
+        self.assertIn("mkfifo", tools.split('"')[1].split())
 
     def test_the_smoke_runs_the_clients_as_the_jobs_do_and_a_sample_of_their_shell(self):
         smoke = read("scripts/smoke-psql.sh")

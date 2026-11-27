@@ -84,7 +84,7 @@ check libpq "libpq links libcrypto" grep -q 'libcrypto\.so' <<<"$libs"
 
 # /bin/sh is busybox's ash; the Jobs run `sh -c` and `sh /mig/migrate.sh`.
 check busybox "/bin/sh -> '$(job 0 readlink /bin/sh 2>&1)'" test "$(job 0 readlink /bin/sh 2>&1)" = "/bin/busybox"
-tools="sh awk sed grep tr head tail cut sort wc cat date sleep sha256sum find xargs mktemp basename dirname printf test expr tee env timeout"
+tools="sh awk sed grep tr head tail cut sort wc cat date sleep sha256sum find xargs mktemp mkfifo basename dirname printf test expr tee env timeout"
 missing=$(job 0 sh -c 'for t in '"$tools"'; do command -v "$t" >/dev/null || printf "%s " "$t"; done' 2>&1)
 check busybox "tools the scripts call are present; missing: '${missing}'" test -z "$missing"
 

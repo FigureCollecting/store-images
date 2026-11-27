@@ -256,10 +256,11 @@ when a newer release appears.
 
 `ghcr.io/figurecollecting/node-npm:v24.22.3-fc1`, for the scraper's `fetch-rulesets` init container (runs npm).
 Base `node:24.22.3-alpine`. Moved: every Alpine package (`apk upgrade`); npm to npm 11.21.3, the newest 11.x
-(npm 12 is out but is a major release; moving to it is a separate change); corepack removed, which
-takes its bundled undici 6.28.0 out of the image. The build and the smoke fail unless every `brace-expansion`
+(npm 12 is out but is a major release; moving to it is a separate change); the npm move clears both
+npm findings (brace-expansion, and undici 6.28.0 in the old npm's own modules). corepack is removed because nothing
+here runs yarn or pnpm; the smoke enforces that, the gate does not. The build and the smoke fail unless every `brace-expansion`
 bundled in npm is at least 5.0.11. Retire when a `node:24` alpine image ships an npm with the fixed
-`brace-expansion` and no vulnerable corepack. The watch follows nodejs/node releases on the 24.x line.
+`brace-expansion` and passes the gate. The watch follows nodejs/node releases on the 24.x line.
 
 ### psql
 
