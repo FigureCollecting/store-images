@@ -1,0 +1,29 @@
+# valkey: upstream's valkey:9.1.4-alpine3.24, pinned by digest, with every Alpine package moved to the newest in the
+# release's repositories (`apk upgrade`: OpenSSL and zlib are what the scan gate flags). valkey, tini, the entrypoint
+# and every setting are upstream's: the same entrypoint and command, port and working directory, no user (the
+# entrypoint drops to upstream's own). The whole file system is one layer, so the old packages are in no layer.
+# The build is not reproducible byte for byte: `apk upgrade` answers with what is current. What it produced is what
+# scripts/scan.sh scans and scripts/smoke-valkey.sh runs before anything is published.
+# Build arguments come from images/valkey.env via scripts/build.sh; target = valkey.
+ARG UPSTREAM_IMAGE=docker.io/valkey/valkey:9.1.4-alpine3.24@sha256:56729e68bdda139cbd3f6a2538683dc3523325fc5711ea1a379938f1b37893f0
+
+FROM ${UPSTREAM_IMAGE} AS rootfs
+RUN apk upgrade --no-cache \
+ && valkey-server --version \
+ && rm -rf /var/cache/apk/*
+
+FROM scratch AS valkey
+ARG UPSTREAM_IMAGE UPSTREAM_TAG FC_REVISION FC_COMMIT CREATED
+COPY --from=rootfs / /
+ENV PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin VALKEY_VERSION=9.1.4
+LABEL org.opencontainers.image.source="https://github.com/FigureCollecting/store-images" \
+      org.opencontainers.image.revision="${FC_COMMIT}" \
+      org.opencontainers.image.version="${UPSTREAM_TAG}-${FC_REVISION}" \
+      org.opencontainers.image.created="${CREATED}" \
+      org.opencontainers.image.base.name="${UPSTREAM_IMAGE}" \
+      org.opencontainers.image.licenses="BSD-3-Clause" \
+      com.figurecollecting.upstream.tag="${UPSTREAM_TAG}"
+WORKDIR /data
+EXPOSE 6379
+ENTRYPOINT ["tini", "--", "docker-entrypoint.sh"]
+CMD ["valkey-server"]

@@ -1,0 +1,38 @@
+# node-npm: upstream's node:24.22.3-alpine, pinned by digest, with
+#   - every Alpine package moved to the newest in the release's repositories (`apk upgrade`);
+#   - npm moved to NPM_VERSION (npm install --global), the build failing unless every brace-expansion bundled in that
+#     npm is at least BRACE_EXPANSION_MIN;
+#   - corepack removed (its bundled undici is what the scan gate flags; nothing here runs yarn or pnpm through it).
+# Everything else is upstream's files and settings: the same entrypoint and command, no user (a deployment sets one),
+# node and yarn as upstream built them. The whole file system is one layer, so the replaced npm, the removed corepack
+# and the old packages are in no layer.
+# The build is not reproducible byte for byte: `apk upgrade` and the npm registry answer with what is current. What it
+# produced is what scripts/scan.sh scans and scripts/smoke-node-npm.sh runs before anything is published.
+# Build arguments come from images/node-npm.env via scripts/build.sh; target = node-npm.
+ARG UPSTREAM_IMAGE=docker.io/library/node:24.22.3-alpine@sha256:116b800c3754b440ee0aa3ed2f20f5bf3d99a554bfd9adeea09ea8017f6e85f5
+
+FROM ${UPSTREAM_IMAGE} AS rootfs
+ARG NPM_VERSION BRACE_EXPANSION_MIN
+RUN apk upgrade --no-cache \
+ && npm install --global "npm@${NPM_VERSION}" \
+ && test "$(npm --version)" = "${NPM_VERSION}" \
+ && node -e 'const fs=require("fs"),path=require("path"),min=process.argv[1].split(".").map(Number);let n=0,bad=[];(function walk(d){for(const e of fs.readdirSync(d,{withFileTypes:true})){if(!e.isDirectory())continue;const f=path.join(d,e.name);if(e.name==="brace-expansion"&&fs.existsSync(path.join(f,"package.json"))){n++;const v=JSON.parse(fs.readFileSync(path.join(f,"package.json"))).version,a=v.split(".").map(Number),ok=a[0]>min[0]||(a[0]===min[0]&&(a[1]>min[1]||(a[1]===min[1]&&a[2]>=min[2])));console.log("brace-expansion",v,f,ok?"ok":"TOO OLD");if(!ok)bad.push(f)}walk(f)}})("/usr/local/lib/node_modules/npm");if(!n||bad.length)process.exit(1)' "${BRACE_EXPANSION_MIN}" \
+ && rm -rf /usr/local/lib/node_modules/corepack /usr/local/bin/corepack /root/.npm /tmp/* /var/cache/apk/* \
+ && ! command -v corepack
+
+FROM scratch AS node-npm
+ARG UPSTREAM_IMAGE UPSTREAM_TAG NPM_VERSION BRACE_EXPANSION_MIN FC_REVISION FC_COMMIT CREATED
+COPY --from=rootfs / /
+ENV PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin NODE_VERSION=24.22.3 YARN_VERSION=1.22.22
+LABEL org.opencontainers.image.source="https://github.com/FigureCollecting/store-images" \
+      org.opencontainers.image.revision="${FC_COMMIT}" \
+      org.opencontainers.image.version="${UPSTREAM_TAG}-${FC_REVISION}" \
+      org.opencontainers.image.created="${CREATED}" \
+      org.opencontainers.image.base.name="${UPSTREAM_IMAGE}" \
+      org.opencontainers.image.licenses="MIT" \
+      com.figurecollecting.upstream.tag="${UPSTREAM_TAG}" \
+      com.figurecollecting.npm.version="${NPM_VERSION}" \
+      com.figurecollecting.brace-expansion.min="${BRACE_EXPANSION_MIN}"
+WORKDIR /
+ENTRYPOINT ["docker-entrypoint.sh"]
+CMD ["node"]

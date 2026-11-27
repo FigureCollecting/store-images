@@ -282,10 +282,11 @@ class RepositoryTest(unittest.TestCase):
             rc = check_pins.main(["--root", ROOT])
         self.assertEqual(rc, 0, out.getvalue())
         # Every recipe, every stage: victoria-traces (upstream, build, runtime, target), grafana (7 stages) and
-        # tailscale (upstream, build, rootfs, target).
+        # tailscale (upstream, build, rootfs, target), and the three Alpine wrappers (rootfs, target).
         self.assertEqual(out.getvalue().splitlines(),
                          ["Dockerfile: 4 FROM, pinned", "Dockerfile.grafana: 7 FROM, pinned",
-                          "Dockerfile.tailscale: 4 FROM, pinned"])
+                          "Dockerfile.node-npm: 2 FROM, pinned", "Dockerfile.psql: 2 FROM, pinned",
+                          "Dockerfile.tailscale: 4 FROM, pinned", "Dockerfile.valkey: 2 FROM, pinned"])
 
     def test_unpinning_any_image_or_download_of_the_tailscale_recipe_is_caught(self):
         text = self.read("Dockerfile.tailscale")

@@ -237,6 +237,49 @@ Known limits:
 - The Tailscale toolchain is a release asset of `github.com/tailscale/go`, verified by checksum only.
 - The Tailscale binaries are static Go and do not load OpenSSL; `apk` and `ssl_client` in the image do.
 
+## Alpine wrappers
+
+Three images that FigureCollecting runs as plain upstream images fail the scan gate on 2026-11-25 only on
+Alpine packages or on tools inside the image. Each is upstream's image (or Alpine) pinned by digest, with
+`apk upgrade` and a few named changes, flattened into one layer so the replaced files are in no layer. The
+command, entrypoint, environment, port and working directory are upstream's, and the smoke test compares them
+with the registry's. Nothing in the layout is new: `images/<app>.env`, `Dockerfile.<app>`,
+`scripts/smoke-<app>.sh`, a unit test, and the build, scan gate and smoke in the pull request and publish
+matrices. The build is not reproducible byte for byte (`apk upgrade` and the npm registry answer with what
+is current); what the build produced is what is scanned, smoked and published.
+
+Each definition has `WATCH_ACTION=retire`: delete the recipe (its `.env`, Dockerfile, smoke and test, and
+the matrix entries) once upstream's own image passes the gate. The weekly upstream-watch asks for that scan
+when a newer release appears.
+
+### node-npm
+
+`ghcr.io/figurecollecting/node-npm:v24.22.3-fc1`, for the scraper's `fetch-rulesets` init container (runs npm).
+Base `node:24.22.3-alpine`. Moved: every Alpine package (`apk upgrade`); npm to npm 11.21.3, the newest 11.x
+(npm 12 is out but is a major release; moving to it is a separate change); corepack removed, which
+takes its bundled undici 6.28.0 out of the image. The build and the smoke fail unless every `brace-expansion`
+bundled in npm is at least 5.0.11. Retire when a `node:24` alpine image ships an npm with the fixed
+`brace-expansion` and no vulnerable corepack. The watch follows nodejs/node releases on the 24.x line.
+
+### psql
+
+`ghcr.io/figurecollecting/psql:17.12-fc1`, for the Jobs that use only `psql` and `pg_isready` (migrations, the
+partition-runway CronJob, the coordinator's migrate and mask-store). Base `alpine:3.24.4`, `apk upgrade`, and
+postgresql17-client 17.12-r0 (Alpine 3.24 main). `postgres:17-alpine` (17.12-alpine3.24) still fails on gosu,
+built with Go 1.24.6; this image has no server and no gosu. The Jobs run their scripts with `sh`, which here is
+busybox ash as before; the image has no bash and no `postgres` user, so a Job sets a numeric user (70 and 10001
+are both smoke-tested). The smoke runs a sample of the Jobs' shell (wait loop, retry function with `case`
+and `$(( ))`, a pipeline in `$( )`). PostgreSQL and Alpine publish no GitHub releases, so the weekly watch
+prints the retire rule from `WATCH_NOTE` and cannot flag a release.
+
+### valkey
+
+`ghcr.io/figurecollecting/valkey:9.1.4-fc1`, for media-redis (cache and queue). Base `valkey:9.1.4-alpine3.24`
+and `apk upgrade`: trivy passes 9.1.4 already; grype wants OpenSSL and zlib from Alpine 3.24 main. Retire when
+docker-library rebuilds on Alpine 3.24.5 and the image passes the gate. The watch follows valkey-io/valkey
+releases on the 9.1.x line (its tags have no `v`). The smoke starts a throwaway server with no network, checks
+PING, a set and a get, and removes the container by the id it recorded.
+
 ## Layout
 
 - `images/<app>.env`: the definition (upstream repo, tag, commit and image, upstream's Go, our Go, the
@@ -262,7 +305,8 @@ Known limits:
   runs the image, checks `/health`, writes a gzip-compressed OTLP span and reads it back through the
   Jaeger API, and checks the version string and `go version -m`;
   `scripts/smoke-grafana.sh` runs Grafana with no network and checks health, the plugins, the defaults
-  and that nothing tried to reach the outside; `scripts/smoke-tailscale.sh` runs Tailscale with no
+  and that nothing tried to reach the outside; `scripts/smoke-node-npm.sh`, `scripts/smoke-psql.sh` and
+  `scripts/smoke-valkey.sh` run the Alpine wrappers with no network; `scripts/smoke-tailscale.sh` runs Tailscale with no
   network and compares it with upstream's image, using `scripts/rootfs_diff.py` to name every path
   that differs between the two file systems; `scripts/check_pins.py` fails on a base image without a
   digest or a download without a checksum; `scripts/upstream_watch.py` reports a newer upstream release.
@@ -287,7 +331,9 @@ Known limits:
   to upstream's image and archive this repo, or move the recipe to the new tag. For a `watch/` entry, check its
   image's scan, re-pin the store and bump the tag in `watch/`; the rebuilds in `images/` stay.
   For Grafana it also watches the two data sources, and a newer release means re-pin and rebuild.
-  For Tailscale a newer release means scan upstream's image and, if it passes, delete the recipe.
+  For Tailscale a newer release means scan upstream's image and, if it passes, delete the recipe. The same
+  holds for node-npm (24.x releases of nodejs/node) and valkey (9.1.x releases of valkey-io/valkey); psql has no
+  release feed, so the watch prints its `WATCH_NOTE`.
 
 Consumers pin by digest. The victoria-traces and grafana packages are internal today; the cluster can pull them only
 after they are made public or a pull secret is added, which is decided before either image is deployed.

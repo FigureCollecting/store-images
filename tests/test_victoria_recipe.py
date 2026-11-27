@@ -37,10 +37,10 @@ def dockerfile_of(name):
 
 
 def current_grafana_releases():
-    """Today's releases for every repository images/grafana.env and images/tailscale.env watch: each at the tag
-    its recipe pins."""
+    """Today's releases for every repository the definitions with a release feed watch (grafana, tailscale, node-npm
+    and valkey; psql has none): each at the tag its recipe pins."""
     releases = {}
-    for name in ("grafana", "tailscale"):
+    for name in ("grafana", "tailscale", "node-npm", "valkey"):
         env = upstream_watch.read_env(os.path.join(ROOT, "images", f"{name}.env"))
         releases.update({upstream_watch.GITHUB.match(env[f"{key}_REPO"]).group(1): [{"tag_name": env[f"{key}_TAG"]}]
                          for key in upstream_watch.watched(env)})
@@ -350,13 +350,13 @@ class InstructionParserTest(unittest.TestCase):
 
 
 class InventoryTest(unittest.TestCase):
-    def test_only_victoria_traces_grafana_and_tailscale_are_rebuilt(self):
+    def test_only_these_images_are_rebuilt_or_wrapped(self):
         # VictoriaLogs v1.54.0 ships Go 1.27.4 and compress v1.20.4 and passes the gate: the store runs upstream's image.
-        self.assertEqual(definitions(), ["grafana", "tailscale", "victoria-traces"])
-        # This Dockerfile rebuilds only victoria-traces; grafana and tailscale have their own recipes.
+        self.assertEqual(definitions(), ["grafana", "node-npm", "psql", "tailscale", "valkey", "victoria-traces"])
+        # This Dockerfile rebuilds only victoria-traces; every other image has its own recipe.
         self.assertEqual([n for n in definitions() if dockerfile_of(n) == "Dockerfile"], ["victoria-traces"])
-        self.assertEqual(dockerfile_of("grafana"), "Dockerfile.grafana")
-        self.assertEqual(dockerfile_of("tailscale"), "Dockerfile.tailscale")
+        for name in ("grafana", "node-npm", "psql", "tailscale", "valkey"):
+            self.assertEqual(dockerfile_of(name), f"Dockerfile.{name}")
         self.assertFalse(os.path.exists(os.path.join(ROOT, "patches", "victoria-logs.patch")))
 
     def test_every_workflow_matrix_and_dockerfile_target_matches_the_definitions(self):
@@ -397,7 +397,8 @@ class InventoryTest(unittest.TestCase):
         # Archiving this repository on a victoria-logs release would drop the rebuilds the stores run.
         self.assertIn("victoria-logs is watch-only", out.getvalue())
         self.assertIn("bump UPSTREAM_TAG in watch/victoria-logs.env", out.getvalue())
-        self.assertIn("The grafana, tailscale and victoria-traces rebuilds stay.", out.getvalue())
+        self.assertIn("The grafana, node-npm, psql, tailscale, valkey and victoria-traces rebuilds stay.",
+                      out.getvalue())
         self.assertNotIn("archive this repository", out.getvalue())
         self.assertNotIn("Re-pin images/", out.getvalue())
 
@@ -437,7 +438,11 @@ class InventoryTest(unittest.TestCase):
         tailscale = upstream_watch.read_env(os.path.join(ROOT, "images", "tailscale.env"))["UPSTREAM_TAG"]
         self.assertIn(f"tailscale: base {tailscale}, newest upstream release {tailscale}: no newer release",
                       out.getvalue())
-        self.assertEqual(len(out.getvalue().splitlines()), 6, out.getvalue())
+        for name in ("node-npm", "valkey"):
+            tag = upstream_watch.read_env(os.path.join(ROOT, "images", f"{name}.env"))["UPSTREAM_TAG"]
+            self.assertIn(f"{name}: base {tag}, newest upstream release {tag}: no newer release", out.getvalue())
+        self.assertIn("psql: no upstream release feed to watch; retire when ", out.getvalue())
+        self.assertEqual(len(out.getvalue().splitlines()), 9, out.getvalue())
 
 
 class SmokeTest(unittest.TestCase):
